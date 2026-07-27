@@ -9,10 +9,10 @@
 #   docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d
 #
 # Security:
-#   - The proxy has NO authentication. Exposing 8765 on 0.0.0.0 means
-#     anyone who can route to your VPS gets free unlimited Gemini via
-#     your Canvas session. Only do this behind Tailscale (or another
-#     private mesh / firewall that restricts 8765 to known peers).
+#   - The proxy requires the bearer token generated on first startup.
+#     Authentication is not a substitute for network isolation: keep 8765
+#     behind Tailscale or another private mesh/firewall and keep the token
+#     out of shell history, compose files, and logs.
 #   - noVNC has no VNC password by default. Exposing 6080 on 0.0.0.0
 #     means anyone with the URL can drive the in-container Chromium
 #     and see whatever you see in the browser. Same caveat — keep it
