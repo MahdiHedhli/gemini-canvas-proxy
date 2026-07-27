@@ -40,6 +40,11 @@ import json
 import threading
 import uuid
 import os
+import base64
+import ipaddress
+import socket
+import urllib.parse
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from queue import Queue, Empty
@@ -90,6 +95,144 @@ def send_message(msg):
 pending_requests = {}  # request_id → Queue (for matching responses to requests)
 payload_store = {}     # request_id → gemini_body (for large payloads that exceed 1MB native messaging limit)
 HOST_PORT = 8765       # Set in main(), used by request handlers for payload fetch URLs
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REMOTE IMAGE FETCHING
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ImageFetchError(ValueError):
+    """A remote image was rejected or could not be fetched safely."""
+
+
+def _url_fetch_enabled():
+    return os.environ.get('PROXY_ALLOW_URL_FETCH', '').lower() in {
+        '1', 'true', 'yes', 'on'
+    }
+
+
+def _validate_public_image_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {'http', 'https'}:
+        raise ImageFetchError("only HTTP and HTTPS URLs are supported")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ImageFetchError("URL authority is invalid")
+
+    try:
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    except ValueError as exc:
+        raise ImageFetchError("URL port is invalid") from exc
+
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            port,
+            type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        raise ImageFetchError(f"hostname resolution failed: {exc}") from exc
+
+    if not addresses:
+        raise ImageFetchError("hostname did not resolve")
+
+    for address_info in addresses:
+        address = ipaddress.ip_address(address_info[4][0])
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_unspecified
+            or address.is_multicast
+            or not address.is_global
+        ):
+            raise ImageFetchError("destination resolves to a non-public address")
+    return parsed
+
+
+class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Apply the destination policy again before following every redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_image_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_remote_image(url):
+    if not _url_fetch_enabled():
+        raise ImageFetchError(
+            "remote URL fetching is disabled; use a data URI or set "
+            "PROXY_ALLOW_URL_FETCH=true"
+        )
+
+    _validate_public_image_url(url)
+    try:
+        max_bytes = int(os.environ.get(
+            'PROXY_MAX_IMAGE_BYTES',
+            str(20 * 1024 * 1024)
+        ))
+    except ValueError as exc:
+        raise ImageFetchError("PROXY_MAX_IMAGE_BYTES must be an integer") from exc
+    if max_bytes <= 0:
+        raise ImageFetchError("PROXY_MAX_IMAGE_BYTES must be positive")
+
+    request = urllib.request.Request(
+        url,
+        headers={'User-Agent': 'GeminiCanvasProxy/1.0'}
+    )
+    opener = urllib.request.build_opener(_PublicOnlyRedirectHandler())
+
+    try:
+        with opener.open(request, timeout=15) as response:
+            content_type = response.headers.get(
+                'Content-Type',
+                'application/octet-stream'
+            ).split(';', 1)[0].strip().lower()
+            if not content_type.startswith('image/'):
+                raise ImageFetchError(
+                    f"response content type is not an image ({content_type})"
+                )
+
+            declared_length = response.headers.get('Content-Length')
+            if declared_length:
+                try:
+                    declared_bytes = int(declared_length)
+                except ValueError as exc:
+                    raise ImageFetchError(
+                        "response Content-Length is invalid"
+                    ) from exc
+                if declared_bytes > max_bytes:
+                    raise ImageFetchError(
+                        f"image exceeds the {max_bytes}-byte limit"
+                    )
+
+            chunks = []
+            received = 0
+            while True:
+                chunk = response.read(min(64 * 1024, max_bytes - received + 1))
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > max_bytes:
+                    raise ImageFetchError(
+                        f"image exceeds the {max_bytes}-byte limit"
+                    )
+                chunks.append(chunk)
+    except ImageFetchError:
+        raise
+    except Exception as exc:
+        raise ImageFetchError(f"fetch failed: {exc}") from exc
+
+    return content_type, base64.b64encode(b''.join(chunks)).decode('ascii')
+
+
+def _log_dropped_image(url, reason):
+    try:
+        host = urllib.parse.urlsplit(url).hostname or '<invalid-host>'
+    except ValueError:
+        host = '<invalid-host>'
+    sys.stderr.write(f"[Proxy] Dropped remote image from {host}: {reason}\n")
+    sys.stderr.flush()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -196,25 +339,25 @@ def openai_to_gemini(body):
                         meta, b64 = url.split(',', 1)
                         mime = meta.split(';')[0].split(':')[1] if ':' in meta else 'image/jpeg'
                         parts.append({"inlineData": {"mimeType": mime, "data": b64}})
-                    elif url.startswith('http'):
+                    elif url.startswith(('http://', 'https://')):
                         # HTTP URL: fetch the image server-side, convert to inlineData
                         # This is necessary because Canvas can't fetch arbitrary URLs,
                         # and Gemini's fileData requires a separate upload step that
                         # the Canvas key may not support.
                         try:
-                            import urllib.request
-                            req = urllib.request.Request(url, headers={'User-Agent': 'GeminiCanvasProxy/1.0'})
-                            with urllib.request.urlopen(req, timeout=15) as resp:
-                                img_data = resp.read()
-                                content_type = resp.headers.get('Content-Type', 'image/jpeg')
-                                # Only process if it's actually an image
-                                if content_type.startswith('image/'):
-                                    import base64
-                                    b64 = base64.b64encode(img_data).decode('utf-8')
-                                    parts.append({"inlineData": {"mimeType": content_type, "data": b64}})
-                        except Exception:
-                            # Silently skip failed fetches — don't break the entire request
-                            pass
+                            content_type, b64 = _fetch_remote_image(url)
+                            parts.append({
+                                "inlineData": {
+                                    "mimeType": content_type,
+                                    "data": b64
+                                }
+                            })
+                        except ImageFetchError as exc:
+                            reason = str(exc)
+                            _log_dropped_image(url, reason)
+                            parts.append({
+                                "text": f"[Remote image omitted: {reason}]"
+                            })
             if parts:
                 # Check total payload size for the 1MB native messaging limit
                 try:

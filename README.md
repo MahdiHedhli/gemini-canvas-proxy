@@ -243,7 +243,11 @@ Google rotates the promoted model periodically. If you get a 403, the Canvas key
   }]
 }
 ```
-**Both `data:` URIs and `http(s)://` URLs are supported.** URL images are fetched server-side by the native host and converted to `inlineData` (since Canvas can't fetch arbitrary URLs).
+`data:` URIs are supported by default. Remote `http(s)://` images are disabled by
+default because fetching caller-controlled URLs expands the proxy's network access.
+To opt in, set `PROXY_ALLOW_URL_FETCH=true`. The host rejects non-public destinations
+and redirects, limits each response to 20 MB, and converts accepted images to
+`inlineData`. Override the ceiling with `PROXY_MAX_IMAGE_BYTES` only when necessary.
 
 **Large payloads (>900KB):** Chrome native messaging limits host→extension messages to 1MB. When a payload exceeds 900KB, the proxy automatically **chunks** it:
 1. Native host splits the serialized JSON into 800KB pieces
