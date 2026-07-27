@@ -40,6 +40,7 @@ import json
 import threading
 import uuid
 import os
+import base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from queue import Queue, Empty
@@ -63,6 +64,10 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 # Chrome communicates with native hosts via stdin/stdout. Each message is:
 #   [4-byte length (native endian)] [UTF-8 JSON payload]
 # Limits: host→extension = 1MB, extension→host = 64MB
+MAX_NATIVE_MESSAGE_BYTES = 1024 * 1024
+# Base64 adds roughly 33%, so 600 KB raw chunks remain near 800 KB after
+# encoding and leave ample room for the native-message JSON envelope.
+RAW_CHUNK_BYTES = 600_000
 
 def read_message():
     """Read a single framed JSON message from Chrome's stdin."""
@@ -78,9 +83,44 @@ def read_message():
 def send_message(msg):
     """Send a framed JSON message to Chrome's stdout."""
     encoded = json.dumps(msg, separators=(',', ':')).encode('utf-8')
+    if len(encoded) > MAX_NATIVE_MESSAGE_BYTES:
+        raise ValueError(
+            f"Native message is {len(encoded)} bytes; limit is "
+            f"{MAX_NATIVE_MESSAGE_BYTES}"
+        )
     sys.stdout.buffer.write(struct.pack('=I', len(encoded)))
     sys.stdout.buffer.write(encoded)
     sys.stdout.buffer.flush()
+
+
+def _chunk_native_payload(serialized, request_id):
+    """Split encoded JSON bytes into base64 native-message envelopes."""
+    chunks = [
+        serialized[offset:offset + RAW_CHUNK_BYTES]
+        for offset in range(0, len(serialized), RAW_CHUNK_BYTES)
+    ]
+    total_chunks = len(chunks)
+    messages = []
+    for index, chunk in enumerate(chunks):
+        message = {
+            "type": "api_request_chunk",
+            "id": request_id,
+            "chunk_index": index,
+            "total_chunks": total_chunks,
+            "chunk_encoding": "base64",
+            "chunk_data": base64.b64encode(chunk).decode('ascii')
+        }
+        encoded_length = len(json.dumps(
+            message,
+            separators=(',', ':')
+        ).encode('utf-8'))
+        if encoded_length > MAX_NATIVE_MESSAGE_BYTES:
+            raise ValueError(
+                f"Chunk message is {encoded_length} bytes; limit is "
+                f"{MAX_NATIVE_MESSAGE_BYTES}"
+            )
+        messages.append(message)
+    return messages
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -507,25 +547,18 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if len(serialized) > 900_000:
             # Payload too large for native messaging (1MB host→extension limit).
-            # Strategy: Chunk the payload into <900KB pieces, send each as a
-            # separate native messaging message. The extension reassembles them.
+            # Strategy: Chunk encoded bytes and base64 each piece for safe JSON
+            # transport. The extension decodes and reassembles the original
+            # UTF-8 byte stream.
             # This works in ALL environments (no HTTP fetch needed, no localhost
             # network access required — pure native messaging).
-            chunk_size = 800_000  # 800KB per chunk (safe margin under 1MB)
-            payload_str = serialized.decode('utf-8')
-            total_chunks = (len(payload_str) + chunk_size - 1) // chunk_size
+            chunk_messages = _chunk_native_payload(serialized, req_id)
+            total_chunks = len(chunk_messages)
             sys.stderr.write(f"[Proxy] Large payload ({len(serialized)}B), sending in {total_chunks} chunks\n")
             sys.stderr.flush()
 
-            for i in range(total_chunks):
-                chunk = payload_str[i * chunk_size : (i + 1) * chunk_size]
-                send_message({
-                    "type": "api_request_chunk",
-                    "id": req_id,
-                    "chunk_index": i,
-                    "total_chunks": total_chunks,
-                    "chunk_data": chunk
-                })
+            for chunk_message in chunk_messages:
+                send_message(chunk_message)
         else:
             # Payload fits within native messaging limit — send inline
             send_message(message_payload)
