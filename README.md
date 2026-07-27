@@ -121,6 +121,11 @@ For users who want the proxy isolated from their system Python, or running 24/7 
 
 **What's in the container:** virtual display, lightweight window manager, Chromium (persistent profile), VNC server, noVNC web UI on `:6080`, and the OpenAI-compatible HTTP API on `:8765`. Login cookies and the auto-generated native messaging manifest survive container restarts via a named volume (`browser-data`).
 
+The container runs the proxy in two explicit roles. The entrypoint owns the HTTP
+listener with `--http-only`; Chromium starts `--bridge-only` through its native
+messaging manifest. They exchange framed messages over a mode-`0600` Unix-domain
+socket, so only one process ever binds port 8765.
+
 **What you do, end-to-end:**
 
 1. `docker compose up -d --build`

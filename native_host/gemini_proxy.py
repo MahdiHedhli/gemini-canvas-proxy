@@ -40,6 +40,9 @@ import json
 import threading
 import uuid
 import os
+import socket
+import stat
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from queue import Queue, Empty
@@ -83,6 +86,36 @@ def send_message(msg):
     sys.stdout.buffer.flush()
 
 
+def _read_socket_message(connection):
+    header = _recv_exact(connection, 4)
+    if header is None:
+        return None
+    length = struct.unpack('=I', header)[0]
+    if length == 0:
+        return None
+    payload = _recv_exact(connection, length)
+    if payload is None:
+        return None
+    return json.loads(payload.decode('utf-8'))
+
+
+def _recv_exact(connection, length):
+    chunks = []
+    remaining = length
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            return None
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
+
+
+def _write_socket_message(connection, msg):
+    encoded = json.dumps(msg, separators=(',', ':')).encode('utf-8')
+    connection.sendall(struct.pack('=I', len(encoded)) + encoded)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # REQUEST TRACKING
 # ═══════════════════════════════════════════════════════════════════════════
@@ -90,6 +123,86 @@ def send_message(msg):
 pending_requests = {}  # request_id → Queue (for matching responses to requests)
 payload_store = {}     # request_id → gemini_body (for large payloads that exceed 1MB native messaging limit)
 HOST_PORT = 8765       # Set in main(), used by request handlers for payload fetch URLs
+bridge_connection = None
+bridge_connection_lock = threading.Lock()
+outbound_sender = send_message
+
+
+def _route_bridge_response(msg):
+    if msg.get('type') != 'api_response':
+        return
+    req_id = msg.get('id')
+    if req_id in pending_requests:
+        pending_requests[req_id].put({
+            "status": msg.get('status'),
+            "data": msg.get('data'),
+            "error": msg.get('error')
+        })
+
+
+def _send_to_bridge_socket(msg):
+    with bridge_connection_lock:
+        if bridge_connection is None:
+            raise ConnectionError("Native messaging bridge is not connected")
+        _write_socket_message(bridge_connection, msg)
+
+
+def _serve_bridge_socket(socket_path):
+    global bridge_connection
+
+    if os.path.lexists(socket_path):
+        mode = os.lstat(socket_path).st_mode
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError(
+                f"Refusing to replace non-socket bridge path: {socket_path}"
+            )
+        os.unlink(socket_path)
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(socket_path)
+    os.chmod(socket_path, 0o600)
+    listener.listen(1)
+    sys.stderr.write(f"[Proxy] Bridge socket listening at {socket_path}\n")
+    sys.stderr.flush()
+
+    while True:
+        connection, _ = listener.accept()
+        sys.stderr.write("[Proxy] Native messaging bridge connected\n")
+        sys.stderr.flush()
+        with bridge_connection_lock:
+            if bridge_connection is not None:
+                bridge_connection.close()
+            bridge_connection = connection
+        try:
+            while True:
+                message = _read_socket_message(connection)
+                if message is None:
+                    break
+                _route_bridge_response(message)
+        except Exception as exc:
+            sys.stderr.write(f"[Proxy] Bridge connection failed: {exc}\n")
+            sys.stderr.flush()
+        finally:
+            with bridge_connection_lock:
+                if bridge_connection is connection:
+                    bridge_connection = None
+            connection.close()
+            sys.stderr.write("[Proxy] Native messaging bridge disconnected\n")
+            sys.stderr.flush()
+
+
+def _connect_bridge_socket(socket_path, timeout=10):
+    deadline = time.monotonic() + timeout
+    while True:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            connection.connect(socket_path)
+            return connection
+        except OSError:
+            connection.close()
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -505,30 +618,32 @@ class APIHandler(BaseHTTPRequestHandler):
         }
         serialized = json.dumps(message_payload, separators=(',', ':')).encode('utf-8')
 
-        if len(serialized) > 900_000:
-            # Payload too large for native messaging (1MB host→extension limit).
-            # Strategy: Chunk the payload into <900KB pieces, send each as a
-            # separate native messaging message. The extension reassembles them.
-            # This works in ALL environments (no HTTP fetch needed, no localhost
-            # network access required — pure native messaging).
-            chunk_size = 800_000  # 800KB per chunk (safe margin under 1MB)
-            payload_str = serialized.decode('utf-8')
-            total_chunks = (len(payload_str) + chunk_size - 1) // chunk_size
-            sys.stderr.write(f"[Proxy] Large payload ({len(serialized)}B), sending in {total_chunks} chunks\n")
-            sys.stderr.flush()
+        try:
+            if len(serialized) > 900_000:
+                # Payload too large for native messaging (1MB host→extension limit).
+                # Strategy: Chunk the payload into <900KB pieces, send each as a
+                # separate native messaging message. The extension reassembles them.
+                chunk_size = 800_000
+                payload_str = serialized.decode('utf-8')
+                total_chunks = (len(payload_str) + chunk_size - 1) // chunk_size
+                sys.stderr.write(f"[Proxy] Large payload ({len(serialized)}B), sending in {total_chunks} chunks\n")
+                sys.stderr.flush()
 
-            for i in range(total_chunks):
-                chunk = payload_str[i * chunk_size : (i + 1) * chunk_size]
-                send_message({
-                    "type": "api_request_chunk",
-                    "id": req_id,
-                    "chunk_index": i,
-                    "total_chunks": total_chunks,
-                    "chunk_data": chunk
-                })
-        else:
-            # Payload fits within native messaging limit — send inline
-            send_message(message_payload)
+                for i in range(total_chunks):
+                    chunk = payload_str[i * chunk_size : (i + 1) * chunk_size]
+                    outbound_sender({
+                        "type": "api_request_chunk",
+                        "id": req_id,
+                        "chunk_index": i,
+                        "total_chunks": total_chunks,
+                        "chunk_data": chunk
+                    })
+            else:
+                outbound_sender(message_payload)
+        except Exception as exc:
+            pending_requests.pop(req_id, None)
+            self._json_error(502, f"Native messaging bridge unavailable: {exc}")
+            return
 
         # Wait for the response (up to 60s)
         try:
@@ -679,9 +794,45 @@ class APIHandler(BaseHTTPRequestHandler):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    global HOST_PORT
+    global HOST_PORT, outbound_sender
     port = int(os.environ.get('PROXY_PORT', '8765'))
     HOST_PORT = port
+    socket_path = os.environ.get(
+        'PROXY_SOCKET',
+        '/tmp/gemini-canvas-proxy.sock'
+    )
+    bridge_only = '--bridge-only' in sys.argv
+    http_only = '--http-only' in sys.argv
+    if bridge_only and http_only:
+        raise SystemExit("--bridge-only and --http-only are mutually exclusive")
+
+    if bridge_only:
+        connection = _connect_bridge_socket(socket_path)
+        sys.stderr.write(f"[Proxy] Bridge-only mode connected to {socket_path}\n")
+        sys.stderr.flush()
+
+        def socket_to_native():
+            try:
+                while True:
+                    message = _read_socket_message(connection)
+                    if message is None:
+                        break
+                    send_message(message)
+            finally:
+                try:
+                    connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+        threading.Thread(target=socket_to_native, daemon=True).start()
+        send_message({"type": "host_ready", "port": port})
+        while True:
+            message = read_message()
+            if message is None:
+                break
+            _write_socket_message(connection, message)
+        connection.close()
+        return
 
     # --standalone mode: run HTTP server without native messaging
     # Useful for debugging or when the extension bridge isn't needed.
@@ -695,6 +846,20 @@ def main():
     server = ThreadedHTTPServer((bind_address, port), APIHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
+
+    if http_only:
+        outbound_sender = _send_to_bridge_socket
+        threading.Thread(
+            target=_serve_bridge_socket,
+            args=(socket_path,),
+            daemon=True
+        ).start()
+        sys.stderr.write(
+            f"[Proxy] HTTP-only mode on http://{bind_address}:{port}\n"
+        )
+        sys.stderr.flush()
+        threading.Event().wait()
+        return
 
     if standalone:
         sys.stderr.write(f"[Proxy] Standalone mode — HTTP server on http://{bind_address}:{port}\n")
@@ -725,14 +890,7 @@ def main():
         if msg is None:
             break
 
-        if msg.get('type') == 'api_response':
-            req_id = msg.get('id')
-            if req_id in pending_requests:
-                pending_requests[req_id].put({
-                    "status": msg.get('status'),
-                    "data": msg.get('data'),
-                    "error": msg.get('error')
-                })
+        _route_bridge_response(msg)
 
     # stdin closed — extension disconnected, but keep HTTP server alive
     # for a bit so in-flight requests can complete

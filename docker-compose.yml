@@ -64,6 +64,7 @@ services:
       # Proxy HTTP bind inside the container. Port mapping handles the host.
       PROXY_BIND: 0.0.0.0
       PROXY_PORT: "8765"
+      PROXY_SOCKET: /tmp/gemini-canvas-proxy.sock
       # noVNC web UI bind inside the container.
       NOVNC_PORT: "6080"
       # VNC server bind (not exposed; websockify bridges to it).
