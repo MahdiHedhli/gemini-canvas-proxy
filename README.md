@@ -228,6 +228,14 @@ Google rotates the promoted model periodically. If you get a 403, the Canvas key
 - ✅ **Multi-turn conversations** — full conversation history
 - ✅ **Format translation** — automatic OpenAI ↔ Gemini conversion
 
+### Supported generation parameters
+
+The proxy translates `temperature`, `max_tokens`, `max_completion_tokens`, `top_p`,
+`top_k`, `stop` (string or list), `seed`, `frequency_penalty`,
+`presence_penalty`, and `response_format: {"type": "json_object"}`. Gemini returns
+one candidate per request; unsupported options such as `n > 1`, `logprobs`, and
+`top_logprobs` are ignored with a stderr warning rather than silently discarded.
+
 ### Multimodal Notes
 
 **Input (vision):** Send images as OpenAI-format content arrays:
