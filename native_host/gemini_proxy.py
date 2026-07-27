@@ -132,6 +132,13 @@ payload_store = {}     # request_id → gemini_body (for large payloads that exc
 HOST_PORT = 8765       # Set in main(), used by request handlers for payload fetch URLs
 
 
+def _warn_ignored_parameter(name):
+    sys.stderr.write(
+        f"[Proxy] WARNING: Ignoring unsupported request parameter: {name}\n"
+    )
+    sys.stderr.flush()
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FORMAT TRANSLATION: OpenAI Chat Completions → Gemini generateContent
 # ═══════════════════════════════════════════════════════════════════════════
@@ -309,8 +316,42 @@ def openai_to_gemini(body):
         gc["maxOutputTokens"] = body["max_tokens"]
     if 'top_p' in body:
         gc["topP"] = body["top_p"]
+    if 'top_k' in body:
+        gc["topK"] = body["top_k"]
+    if 'seed' in body:
+        gc["seed"] = body["seed"]
+    if 'frequency_penalty' in body:
+        gc["frequencyPenalty"] = body["frequency_penalty"]
+    if 'presence_penalty' in body:
+        gc["presencePenalty"] = body["presence_penalty"]
     if 'max_completion_tokens' in body:
         gc["maxOutputTokens"] = body["max_completion_tokens"]
+    if 'stop' in body:
+        if isinstance(body["stop"], str):
+            gc["stopSequences"] = [body["stop"]]
+        elif (
+            isinstance(body["stop"], list)
+            and all(isinstance(item, str) for item in body["stop"])
+        ):
+            gc["stopSequences"] = body["stop"]
+        else:
+            _warn_ignored_parameter("stop (expected a string or string list)")
+
+    response_format = body.get('response_format')
+    if (
+        isinstance(response_format, dict)
+        and response_format.get("type") == "json_object"
+    ):
+        gc["responseMimeType"] = "application/json"
+    elif response_format is not None:
+        _warn_ignored_parameter("response_format")
+
+    if body.get('n', 1) != 1:
+        _warn_ignored_parameter("n")
+    if body.get('logprobs'):
+        _warn_ignored_parameter("logprobs")
+    if body.get('top_logprobs') is not None:
+        _warn_ignored_parameter("top_logprobs")
 
     # ── Tool definitions ──────────────────────────────────────────────────
     # Canvas requires: single tools object, all functions in one array,
