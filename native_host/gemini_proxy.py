@@ -124,12 +124,10 @@ def openai_to_gemini(body):
         # ── Assistant messages with tool_calls ────────────────────────────
         # Send native functionCall parts in history. Gemini 3 requires a
         # thoughtSignature on functionCall parts for validation.
-        # CanvasToAPI uses a dummy signature that passes validation.
         if role == 'assistant' and msg.get('tool_calls'):
             parts = []
             if content:
                 parts.append({"text": content})
-            signature_added = False
             for tc in msg.get('tool_calls', []):
                 func = tc.get('function', {})
                 args_str = func.get('arguments', '{}')
@@ -137,11 +135,22 @@ def openai_to_gemini(body):
                     args_parsed = json.loads(args_str)
                 except Exception:
                     args_parsed = {}
-                fc_part = {"functionCall": {"name": func.get('name', ''), "args": args_parsed}}
-                # Gemini 3 requires thoughtSignature on the first functionCall
-                if not signature_added:
-                    fc_part["thoughtSignature"] = "context_engineering_is_the_way_to_go"
-                    signature_added = True
+                fc_part = {
+                    "functionCall": {
+                        "name": func.get('name', ''),
+                        "args": args_parsed
+                    }
+                }
+                signature = tc.get('x_gemini_thought_signature')
+                if not signature:
+                    signature = "context_engineering_is_the_way_to_go"
+                    sys.stderr.write(
+                        "[Proxy] WARNING: Missing Gemini thoughtSignature for "
+                        f"function call {func.get('name', '<unnamed>')}; "
+                        "using compatibility fallback\n"
+                    )
+                    sys.stderr.flush()
+                fc_part["thoughtSignature"] = signature
                 parts.append(fc_part)
             contents.append({"role": "model", "parts": parts})
             continue
@@ -371,14 +380,17 @@ def gemini_to_openai(gemini_response, model):
         for p in parts:
             if 'functionCall' in p:
                 fc = p['functionCall']
-                tool_calls.append({
+                tool_call = {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "function",
                     "function": {
                         "name": fc.get('name', ''),
                         "arguments": json.dumps(fc.get('args', {}))
                     }
-                })
+                }
+                if p.get('thoughtSignature'):
+                    tool_call["x_gemini_thought_signature"] = p["thoughtSignature"]
+                tool_calls.append(tool_call)
 
         finish_reason = candidate.get('finishReason', 'stop').lower()
         if finish_reason == 'max_tokens':
