@@ -59,11 +59,41 @@ function connectNative() {
 // Chunk reassembly buffer: { request_id: { chunks: [], total: N } }
 const chunkBuffer = {};
 
+function decodeBase64Chunks(chunks) {
+    const decoded = chunks.map((chunk) => {
+        const binary = atob(chunk);
+        return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    });
+    const totalBytes = decoded.reduce((total, chunk) => total + chunk.length, 0);
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of decoded) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return {
+        json: new TextDecoder('utf-8', { fatal: true }).decode(combined),
+        byteLength: totalBytes
+    };
+}
+
 async function handleApiRequest(msg) {
     // Handle chunked payloads (>1MB native messaging limit)
     if (msg.type === 'api_request_chunk') {
         if (!chunkBuffer[msg.id]) {
             chunkBuffer[msg.id] = { chunks: [], total: msg.total_chunks };
+        }
+        if (msg.chunk_encoding !== 'base64') {
+            console.error('[Proxy] Unsupported chunk encoding');
+            if (nativePort) {
+                nativePort.postMessage({
+                    type: 'api_response',
+                    id: msg.id,
+                    error: 'Unsupported chunk encoding'
+                });
+            }
+            delete chunkBuffer[msg.id];
+            return;
         }
         chunkBuffer[msg.id].chunks[msg.chunk_index] = msg.chunk_data;
 
@@ -75,12 +105,12 @@ async function handleApiRequest(msg) {
         if (received < buf.total) return; // Wait for more chunks
 
         // All chunks received — reassemble
-        const fullJson = buf.chunks.join('');
         delete chunkBuffer[msg.id];
-        console.log('[Proxy] All chunks reassembled, size:', fullJson.length, 'bytes');
 
         try {
-            msg = JSON.parse(fullJson);
+            const reassembled = decodeBase64Chunks(buf.chunks);
+            console.log('[Proxy] All chunks reassembled, size:', reassembled.byteLength, 'bytes');
+            msg = JSON.parse(reassembled.json);
         } catch (e) {
             console.error('[Proxy] Failed to parse reassembled payload:', e);
             if (nativePort) {
