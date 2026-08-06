@@ -140,17 +140,11 @@ WEBSOCKIFY_PID=$!
 # The Python native host runs LAST so Xvfb/x11vnc/websockify are already
 # accepting connections when the healthcheck starts polling.
 #
-# Standalone mode would let the proxy's main() `return` immediately,
-# killing the process and the HTTP thread with it. We launch WITHOUT
-# --standalone and instead hold stdin open via a long sleep on the write
-# end of the pipe, so the proxy's `read_message()` blocks forever and the
-# HTTP thread stays alive.
-#
-# Stdout is captured to /tmp/proxy.log too — the proxy writes a
-# `host_ready` JSON message to stdout in non-standalone mode that we don't
-# want leaking into `docker compose logs`.
+# The entrypoint owns HTTP only. Chromium starts the native messaging bridge
+# separately via gemini_proxy_bridge.sh; the two roles communicate over a
+# Unix-domain socket and never race for the TCP listener.
 echo "[entrypoint] Starting gemini_proxy.py on $PROXY_BIND:$PROXY_PORT"
-( sleep infinity ) | python3 /app/native_host/gemini_proxy.py \
+python3 /app/native_host/gemini_proxy.py --http-only \
     >/tmp/proxy.log 2>&1 &
 PROXY_PID=$!
 

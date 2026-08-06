@@ -30,7 +30,7 @@
 CHROMIUM_USER_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-/browser-data/chromium-profile}"
 NATIVE_HOST_DIR="${NATIVE_HOST_DIR:-$CHROMIUM_USER_DATA_DIR/NativeMessagingHosts}"
 MANIFEST_PATH="$NATIVE_HOST_DIR/com.gemini.proxy.json"
-HOST_SCRIPT="/app/native_host/gemini_proxy.py"
+HOST_SCRIPT="/app/native_host/gemini_proxy_bridge.sh"
 
 if [ -n "${1:-}" ]; then
     EXTENSION_ID="$1"
