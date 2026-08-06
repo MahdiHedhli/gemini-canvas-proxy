@@ -26,6 +26,7 @@ DISPLAY_NUM="${DISPLAY_NUM:-99}"
 BROWSER_DATA_DIR="${BROWSER_DATA_DIR:-/browser-data}"
 CHROMIUM_USER_DATA_DIR="${CHROMIUM_USER_DATA_DIR:-$BROWSER_DATA_DIR/chromium-profile}"
 NATIVE_HOST_DIR="${NATIVE_HOST_DIR:-$BROWSER_DATA_DIR/NativeMessagingHosts}"
+PROXY_TOKEN_FILE="${PROXY_TOKEN_FILE:-$BROWSER_DATA_DIR/proxy-token}"
 # $HOME is /app (read-only bind mount). Use /tmp for any X11/scratch state
 # and /browser-data for anything that must survive container restarts.
 export HOME="/browser-data/home"
@@ -35,6 +36,17 @@ mkdir -p \
     "$HOME" \
     "$HOME/.config" \
     /tmp/x11
+
+if [ -z "${PROXY_TOKEN:-}" ] && [ ! -s "$PROXY_TOKEN_FILE" ]; then
+    umask 077
+    python3 -c 'import uuid; print(uuid.uuid4())' > "$PROXY_TOKEN_FILE"
+fi
+export PROXY_TOKEN_FILE
+if [ -z "${PROXY_TOKEN:-}" ]; then
+    echo "[entrypoint] Proxy bearer token: $(tr -d '\r\n' < "$PROXY_TOKEN_FILE")"
+else
+    echo "[entrypoint] Proxy bearer token supplied through PROXY_TOKEN"
+fi
 
 # Note: preflight.sh (called by the Dockerfile ENTRYPOINT) already chowned
 # /browser-data as root before exec'ing this script as `proxy`. Don't
@@ -128,17 +140,11 @@ WEBSOCKIFY_PID=$!
 # The Python native host runs LAST so Xvfb/x11vnc/websockify are already
 # accepting connections when the healthcheck starts polling.
 #
-# Standalone mode would let the proxy's main() `return` immediately,
-# killing the process and the HTTP thread with it. We launch WITHOUT
-# --standalone and instead hold stdin open via a long sleep on the write
-# end of the pipe, so the proxy's `read_message()` blocks forever and the
-# HTTP thread stays alive.
-#
-# Stdout is captured to /tmp/proxy.log too — the proxy writes a
-# `host_ready` JSON message to stdout in non-standalone mode that we don't
-# want leaking into `docker compose logs`.
+# The entrypoint owns HTTP only. Chromium starts the native messaging bridge
+# separately via gemini_proxy_bridge.sh; the two roles communicate over a
+# Unix-domain socket and never race for the TCP listener.
 echo "[entrypoint] Starting gemini_proxy.py on $PROXY_BIND:$PROXY_PORT"
-( sleep infinity ) | python3 /app/native_host/gemini_proxy.py \
+python3 /app/native_host/gemini_proxy.py --http-only \
     >/tmp/proxy.log 2>&1 &
 PROXY_PID=$!
 

@@ -17,7 +17,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NATIVE_HOST_NAME="com.gemini.proxy"
 HOST_SCRIPT="$SCRIPT_DIR/native_host/gemini_proxy.py"
-HOST_MANIFEST_TEMPLATE="$SCRIPT_DIR/native_host/com.gemini.proxy.json"
+TOKEN_FILE="$SCRIPT_DIR/native_host/.proxy_token"
 
 # Sanity check: make sure we're in the right directory
 if [ ! -f "$HOST_SCRIPT" ]; then
@@ -47,8 +47,9 @@ echo "4. Copy the Extension ID (32-char string below the extension name)"
 echo ""
 read -p "Paste Extension ID: " EXTENSION_ID
 
-if [ -z "$EXTENSION_ID" ]; then
-    echo "✗ No extension ID provided. Aborting."
+if ! [[ "$EXTENSION_ID" =~ ^[a-p]{32}$ ]]; then
+    echo "✗ Invalid extension ID."
+    echo "  Chrome extension IDs must contain exactly 32 characters from a-p."
     exit 1
 fi
 
@@ -124,6 +125,13 @@ fi
 if command -v python3 &>/dev/null; then
     PYTHON_VER=$(python3 --version 2>&1)
     echo "✓ Python found: $PYTHON_VER"
+    if [ ! -s "$TOKEN_FILE" ]; then
+        umask 077
+        python3 -c 'import uuid; print(uuid.uuid4())' > "$TOKEN_FILE"
+    fi
+    chmod 600 "$TOKEN_FILE"
+    PROXY_TOKEN="$(tr -d '\r\n' < "$TOKEN_FILE")"
+    echo "✓ Bearer token written to $TOKEN_FILE"
 else
     echo ""
     echo "⚠ python3 not found. The native host requires Python 3.8+."
@@ -154,8 +162,12 @@ echo "     with a green 'Proxy Active' status"
 echo ""
 echo "  10. Test the proxy:"
 echo "      curl http://127.0.0.1:8765/v1/chat/completions \\"
+echo "        -H 'Authorization: Bearer $PROXY_TOKEN' \\"
 echo "        -H 'Content-Type: application/json' \\"
 echo "        -d '{\"model\":\"gemini-3-flash-preview\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}'"
+echo ""
+echo "  Bearer token: $PROXY_TOKEN"
+echo "  Keep this token private; clients must send it as their API key."
 echo ""
 echo "  11. Use it in any OpenAI-compatible app (see README.md)"
 echo ""

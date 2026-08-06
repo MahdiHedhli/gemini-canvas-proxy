@@ -96,7 +96,8 @@ COPY --chown=root:root preflight.sh /app/preflight.sh
 # so a bare `chmod +x` ends up at 0700 and the proxy user (which IS the
 # group) can't exec them.
 RUN chmod 755 /app/entrypoint.sh /app/setup-extension.sh /app/preflight.sh \
-    && chmod 755 /app/native_host/gemini_proxy.py
+    && chmod 755 /app/native_host/gemini_proxy.py \
+    && chmod 755 /app/native_host/gemini_proxy_bridge.sh
 
 # Intentionally stay as ROOT in the image — preflight.sh chowns
 # /browser-data (potentially a host-bind mount with different ownership)
@@ -121,6 +122,7 @@ CMD []
 
 ENV PROXY_BIND=0.0.0.0 \
     PROXY_PORT=8765 \
+    PROXY_TOKEN_FILE=/browser-data/proxy-token \
     PYTHONUNBUFFERED=1 \
     DISPLAY=:99 \
     NOVNC_PORT=6080 \

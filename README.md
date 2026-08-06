@@ -1,6 +1,6 @@
 # ⚡ Gemini Canvas Proxy
 
-**Free unlimited Gemini API via Canvas + Chrome extension bridge. No WebSocket, no Local Network Access issues — uses `postMessage` which bypasses Chrome 142+ restrictions entirely.**
+**Free unlimited Gemini API via Canvas + Chrome extension bridge. No WebSocket or Local Network Access issues — uses a private `MessageChannel` instead of a network connection.**
 
 [![Models](https://img.shields.io/badge/models-4%20working-blue)](#available-models)
 
@@ -28,8 +28,8 @@ Chrome Extension (service worker)         ← Routes to the Gemini tab
     ▼
 Content Script (top-level Gemini page)    ← Relay between extension and iframe
     │
-    ├── window.postMessage                ← Works across sandbox boundaries!
-    │                                      (NOT a network call — never blocked)
+    ├── MessageChannel                    ← Private port transferred once via
+    │                                      postMessage across the sandbox boundary
     ▼
 Canvas Proxy Page (in sandboxed iframe)   ← fetch() to Gemini API (FREE)
     │
@@ -44,7 +44,10 @@ Response flows back the same path → HTTP response to your app
 
 **CanvasToAPI** and similar projects use WebSocket (`ws://localhost:port`) to bridge between the Canvas page and a local server. Chrome 142+ [Local Network Access](https://developers.google.com/privacy-sandbox/blog/local-network-access) blocks these connections from sandboxed iframes — requiring users to disable `chrome://flags/#local-network-access-check`, which is disappearing in Chrome 145+.
 
-**This project uses `postMessage` instead** — a browser-level IPC mechanism that works across sandbox boundaries without any network calls. Chrome cannot block it because it's not a network request. This makes the proxy future-proof.
+**This project uses a `MessageChannel` instead** — browser-level IPC that works
+across the Canvas sandbox boundary without a local network request. The Canvas page
+transfers a private port during a one-time `postMessage` handshake; API requests and
+responses then travel only over that port.
 
 ### How Canvas Auth Works
 
@@ -102,8 +105,13 @@ Use the self-contained Docker Compose stack — see [Docker (Self-Contained)](#d
 
 ### 4. Test It
 
+`setup.sh` or `setup.ps1` prints a generated bearer token. On Linux/macOS,
+you can load the persisted token into your shell without copying it:
+
 ```bash
+PROXY_TOKEN="$(cat native_host/.proxy_token)"
 curl http://127.0.0.1:8765/v1/chat/completions \
+  -H "Authorization: Bearer $PROXY_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "gemini-3-flash-preview",
@@ -121,6 +129,11 @@ For users who want the proxy isolated from their system Python, or running 24/7 
 
 **What's in the container:** virtual display, lightweight window manager, Chromium (persistent profile), VNC server, noVNC web UI on `:6080`, and the OpenAI-compatible HTTP API on `:8765`. Login cookies and the auto-generated native messaging manifest survive container restarts via a named volume (`browser-data`).
 
+The container runs the proxy in two explicit roles. The entrypoint owns the HTTP
+listener with `--http-only`; Chromium starts `--bridge-only` through its native
+messaging manifest. They exchange framed messages over a mode-`0600` Unix-domain
+socket, so only one process ever binds port 8765.
+
 **What you do, end-to-end:**
 
 1. `docker compose up -d --build`
@@ -128,9 +141,17 @@ For users who want the proxy isolated from their system Python, or running 24/7 
 3. In the noVNC window: log in to `gemini.google.com`, navigate to `chrome://extensions`, enable Developer mode, **Load unpacked → `/app/extension`** (the extension folder is bind-mounted read-only from the repo).
 4. Copy the Extension ID (32 lowercase characters).
 5. From your laptop: `docker compose exec proxy /app/setup-extension.sh <extension-id>` — this writes the native messaging manifest into the persistent volume so Chromium can find the host on next launch.
-6. `docker compose restart proxy` (so Chromium re-reads the manifest), then `curl http://127.0.0.1:8765/v1/models` to confirm.
+6. `docker compose restart proxy` so Chromium re-reads the manifest.
+7. Read the generated token and test the authenticated endpoint:
 
-After step 6 the setup is durable: restarts of the container, host reboots, and `docker compose down / up` cycles all preserve your login session and the manifest.
+   ```bash
+   PROXY_TOKEN="$(docker compose exec -T proxy cat /browser-data/proxy-token)"
+   curl -H "Authorization: Bearer $PROXY_TOKEN" \
+     http://127.0.0.1:8765/v1/models
+   ```
+
+After setup, restarts of the container, host reboots, and `docker compose down / up`
+cycles preserve your login session, manifest, and bearer token.
 
 ### Local loopback (default)
 
@@ -149,10 +170,16 @@ The `docker-compose.vps.yml` override flips both the noVNC web UI (`6080`) and t
 docker compose -f docker-compose.yml -f docker-compose.vps.yml up -d --build
 # From any tailnet device:
 open http://<vps-tailscale-ip>:6080/vnc.html?autoconnect=true&resize=scale
-curl http://<vps-tailscale-ip>:8765/v1/models
+curl -H "Authorization: Bearer $PROXY_TOKEN" \
+  http://<vps-tailscale-ip>:8765/v1/models
 ```
 
-**Security:** the proxy has no authentication, and noVNC has no VNC password by default. Only expose `0.0.0.0:6080` and `0.0.0.0:8765` behind a private mesh (Tailscale, WireGuard, firewall) that restricts both ports to known peers. If you need a VNC password, set `VNC_PASSWORD` and pass `-rfbauth` to x11vnc in `entrypoint.sh`.
+**Security:** the proxy requires its generated bearer token, but noVNC has no VNC
+password by default. Authentication does not replace network isolation: only expose
+`0.0.0.0:6080` and `0.0.0.0:8765` behind a private mesh (Tailscale, WireGuard,
+firewall) that restricts both ports to known peers. Keep the token private. If you
+need a VNC password, set `VNC_PASSWORD` and pass `-rfbauth` to x11vnc in
+`entrypoint.sh`.
 
 ### Shared folder with the host (override)
 
@@ -219,6 +246,9 @@ Google rotates the promoted model periodically. If you get a 403, the Canvas key
 | `/v1/models` | GET | List available models |
 | `/health` | GET | Health check |
 
+All `/v1/*` endpoints require `Authorization: Bearer <token>`. `/health` remains
+unauthenticated for local and container health checks.
+
 ### Features
 - ✅ **Chat completions** — text generation with system prompts
 - ✅ **Tool/function calling** — native Gemini function calling with `thoughtSignature` support; tool results sent back as native `functionResponse` parts
@@ -251,7 +281,11 @@ one candidate per request; unsupported options such as `n > 1`, `logprobs`, and
   }]
 }
 ```
-**Both `data:` URIs and `http(s)://` URLs are supported.** URL images are fetched server-side by the native host and converted to `inlineData` (since Canvas can't fetch arbitrary URLs).
+`data:` URIs are supported by default. Remote `http(s)://` images are disabled by
+default because fetching caller-controlled URLs expands the proxy's network access.
+To opt in, set `PROXY_ALLOW_URL_FETCH=true`. The host rejects non-public destinations
+and redirects, limits each response to 20 MB, and converts accepted images to
+`inlineData`. Override the ceiling with `PROXY_MAX_IMAGE_BYTES` only when necessary.
 
 **Large payloads (>900KB):** Chrome native messaging limits host→extension messages to 1MB. When a payload exceeds 900KB, the proxy automatically **chunks** it:
 1. Native host splits the serialized JSON into 800KB pieces
@@ -292,7 +326,7 @@ The proxy uses **native Gemini function calling** for both outgoing tool calls a
    - **`Custom (Direct API)`**
 3. When prompted, enter:
    - **Base URL**: `http://127.0.0.1:8765/v1`
-   - **API Key**: Press **Enter** (not needed)
+   - **API Key**: the bearer token printed by the setup script
 4. Select one of the available models (e.g., `gemini-3-flash-preview`).
 
 #### Option 2: Manual Config
@@ -303,6 +337,7 @@ Add the proxy as a custom provider in `~/.hermes/config.yaml`:
 custom_providers:
   - name: "Local (127.0.0.1:8765)"
     base_url: http://127.0.0.1:8765/v1
+    api_key: "<token printed by setup>"
     model: gemini-3-flash-preview
     api_mode: chat_completions
 ```
@@ -323,11 +358,12 @@ Point any tool that accepts an OpenAI base URL to `http://127.0.0.1:8765/v1`:
 
 ```python
 # Python OpenAI SDK
+import os
 from openai import OpenAI
 
 client = OpenAI(
     base_url="http://127.0.0.1:8765/v1",
-    api_key="not-needed"
+    api_key=os.environ["GEMINI_PROXY_TOKEN"]
 )
 
 response = client.chat.completions.create(
@@ -343,7 +379,7 @@ import OpenAI from "openai";
 
 const client = new OpenAI({
   baseURL: "http://127.0.0.1:8765/v1",
-  apiKey: "not-needed",
+  apiKey: process.env.GEMINI_PROXY_TOKEN,
 });
 
 const response = await client.chat.completions.create({
@@ -354,9 +390,24 @@ const response = await client.chat.completions.create({
 
 ```bash
 # LangChain
-export OPENAI_API_KEY=not-needed
+export OPENAI_API_KEY="$GEMINI_PROXY_TOKEN"
 export OPENAI_API_BASE=http://127.0.0.1:8765/v1
 ```
+
+---
+
+## Security
+
+- The native host binds to `127.0.0.1` by default. Set `PROXY_BIND` only when
+  remote access is intentional and protected by a firewall or private network.
+- Every `/v1/*` request requires the generated bearer token. `/health` is the
+  only unauthenticated endpoint.
+- Browser CORS access is disabled by default. Set `PROXY_ALLOWED_ORIGIN` to one
+  exact origin only when a browser client genuinely needs access.
+- Request bodies are capped at 32 MB by default. Override
+  `PROXY_MAX_REQUEST_BYTES` only after considering memory use.
+- Treat `native_host/.proxy_token` and `/browser-data/proxy-token` as secrets.
+  Do not commit them or put tokens directly in shared configuration files.
 
 ---
 
@@ -368,7 +419,7 @@ gemini-canvas-proxy/
 ├── extension/
 │   ├── manifest.json          # Chrome MV3 extension manifest
 │   ├── background.js          # Service worker: native host ↔ content script
-│   └── content_script.js      # PostMessage relay: iframe ↔ extension
+│   └── content_script.js      # MessageChannel relay: iframe ↔ extension
 ├── native_host/
 │   └── gemini_proxy.py        # HTTP server (:8765) + OpenAI↔Gemini translation
 ├── setup.sh                   # Setup script (Linux / macOS)
@@ -425,7 +476,8 @@ gemini-canvas-proxy/
 
 - **Canvas tab must stay open** — closing it kills the proxy
 - **Model-scoped key** — only the currently promoted model works
-- **Large payloads** — payloads >900KB are automatically chunked into 800KB pieces across multiple native messaging messages (bypasses 1MB limit). No size limit in practice.
+- **Large payloads** — payloads >900KB are chunked across multiple native
+  messages so each message stays below Chrome's 1MB host-to-extension cap.
 - **No real streaming** — responses are buffered then sent as a single SSE chunk (but `tool_calls` are correctly emitted in streaming format with proper `finish_reason`)
 - **ToS risk** — using Canvas credentials outside Canvas may violate Google's Terms of Service
 - **Tool calling** — uses native Gemini function calling with `thoughtSignature` for history. Tool schemas are automatically sanitized to remove Gemini-incompatible JSON Schema fields
