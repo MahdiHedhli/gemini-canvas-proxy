@@ -523,6 +523,36 @@ def _sanitize_schema_for_gemini(obj):
 # FORMAT TRANSLATION: Gemini generateContent → OpenAI Chat Completions
 # ═══════════════════════════════════════════════════════════════════════════
 
+class GeminiResponseError(ValueError):
+    """Gemini returned no usable completion."""
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+FINISH_REASON_MAP = {
+    'STOP': 'stop',
+    'MAX_TOKENS': 'length',
+    'SAFETY': 'content_filter',
+    'RECITATION': 'content_filter',
+    'BLOCKLIST': 'content_filter',
+    'PROHIBITED_CONTENT': 'content_filter',
+}
+
+
+def _map_finish_reason(reason):
+    normalized = str(reason or 'STOP').upper()
+    mapped = FINISH_REASON_MAP.get(normalized)
+    if mapped:
+        return mapped
+    sys.stderr.write(
+        f"[Proxy] WARNING: Unmapped Gemini finishReason {normalized}; using stop\n"
+    )
+    sys.stderr.flush()
+    return 'stop'
+
+
 def gemini_to_openai(gemini_response, model):
     """
     Convert a Gemini API response to OpenAI chat completion format.
@@ -537,60 +567,77 @@ def gemini_to_openai(gemini_response, model):
     image_parts = []
     finish_reason = "stop"
 
-    if candidates:
-        candidate = candidates[0]
-        parts = candidate.get('content', {}).get('parts', [])
-
-        # Extract text, images, and function calls from parts
-        tool_calls = []
-        for p in parts:
-            if 'text' in p:
-                text_parts.append(p['text'])
-            elif 'inlineData' in p:
-                # Image generation models return images as inlineData
-                img_data = p['inlineData'].get('data', '')
-                mime = p['inlineData'].get('mimeType', 'image/png')
-                image_parts.append(f"![generated_image](data:{mime};base64,{img_data})")
-
-        # Check for function calls
-        for p in parts:
-            if 'functionCall' in p:
-                fc = p['functionCall']
-                tool_call = {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {
-                        "name": fc.get('name', ''),
-                        "arguments": json.dumps(fc.get('args', {}))
-                    }
-                }
-                if p.get('thoughtSignature'):
-                    tool_call["x_gemini_thought_signature"] = p["thoughtSignature"]
-                tool_calls.append(tool_call)
-
-        finish_reason = candidate.get('finishReason', 'stop').lower()
-        if finish_reason == 'max_tokens':
-            finish_reason = 'length'
-
-        # Combine text and image parts into content
-        content = '\n'.join(text_parts + image_parts) or None
-
-        if tool_calls:
-            return {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                "object": "chat.completion",
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        "tool_calls": tool_calls
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": _extract_usage(gemini_response)
+    if not candidates:
+        feedback = gemini_response.get('promptFeedback', {})
+        block_reason = feedback.get('blockReason', 'UNKNOWN')
+        raise GeminiResponseError(
+            f"Gemini returned no candidates (block reason: {block_reason})",
+            {
+                "blockReason": block_reason,
+                "safetyRatings": feedback.get('safetyRatings', [])
             }
+        )
+
+    candidate = candidates[0]
+    parts = candidate.get('content', {}).get('parts', [])
+    raw_finish_reason = candidate.get('finishReason', 'STOP')
+    finish_reason = _map_finish_reason(raw_finish_reason)
+    if not parts and str(raw_finish_reason).upper() != 'STOP':
+        raise GeminiResponseError(
+            "Gemini returned no content "
+            f"(finish reason: {str(raw_finish_reason).upper()})",
+            {
+                "finishReason": str(raw_finish_reason).upper(),
+                "safetyRatings": candidate.get('safetyRatings', [])
+            }
+        )
+
+    # Extract text, images, and function calls from parts
+    tool_calls = []
+    for p in parts:
+        if 'text' in p:
+            text_parts.append(p['text'])
+        elif 'inlineData' in p:
+            # Image generation models return images as inlineData
+            img_data = p['inlineData'].get('data', '')
+            mime = p['inlineData'].get('mimeType', 'image/png')
+            image_parts.append(f"![generated_image](data:{mime};base64,{img_data})")
+
+    # Check for function calls
+    for p in parts:
+        if 'functionCall' in p:
+            fc = p['functionCall']
+            tool_call = {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": fc.get('name', ''),
+                    "arguments": json.dumps(fc.get('args', {}))
+                }
+            }
+            if p.get('thoughtSignature'):
+                tool_call["x_gemini_thought_signature"] = p["thoughtSignature"]
+            tool_calls.append(tool_call)
+
+    # Combine text and image parts into content
+    content = '\n'.join(text_parts + image_parts) or None
+
+    if tool_calls:
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": _extract_usage(gemini_response)
+        }
 
     content = '\n'.join(text_parts + image_parts) or ""
 
@@ -772,7 +819,11 @@ class APIHandler(BaseHTTPRequestHandler):
             self._json_error(502, resp['error'])
             return
 
-        openai_response = gemini_to_openai(resp.get('data', {}), model)
+        try:
+            openai_response = gemini_to_openai(resp.get('data', {}), model)
+        except GeminiResponseError as exc:
+            self._json_error(502, str(exc), exc.details)
+            return
 
         if stream:
             self._send_streaming(openai_response, model)
@@ -888,8 +939,11 @@ class APIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json_error(self, code, message, authenticate=False):
-        body = json.dumps({"error": {"message": message, "type": "proxy_error"}}).encode('utf-8')
+    def _json_error(self, code, message, details=None, authenticate=False):
+        error = {"message": message, "type": "proxy_error"}
+        if details:
+            error["details"] = details
+        body = json.dumps({"error": error}).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self._send_cors_header()
