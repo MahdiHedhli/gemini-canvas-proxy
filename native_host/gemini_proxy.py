@@ -11,7 +11,7 @@ How it works:
     2. Incoming OpenAI-format requests are translated to Gemini format
     3. Translated requests are sent to the Chrome extension via stdio
        (Chrome native messaging protocol: 4-byte length + JSON)
-    4. The extension forwards them to the Canvas page via postMessage
+    4. The extension relays them to the Canvas page
     5. The Canvas page calls the Gemini API with its auto-injected key
     6. Responses flow back: Canvas → extension → native host → HTTP
 
@@ -22,11 +22,11 @@ The Canvas internal API key is:
     - Auto-injected by Canvas when code contains `apiKey = ""`
 
 Limitations:
-    - The Canvas key rejects native function/functionResponse roles in
-      conversation history. We work around this by converting tool calls
-      and results to plain text messages (model still understands them).
-    - 1MB max response size (Chrome native messaging limit)
-    - Streaming is faked (single chunk + [DONE])
+    - The Canvas tab must remain open and its key is model/session scoped.
+    - Native tool calls use Gemini functionCall/functionResponse parts.
+    - Large host-to-extension requests are chunked below Chrome's per-message
+      native messaging limit.
+    - Streaming is simulated after the full Gemini response arrives.
 
 Credits:
     The postMessage bridge concept was inspired by coxcelot's "I am canceled"
@@ -134,8 +134,6 @@ def _chunk_native_payload(serialized, request_id):
 # ═══════════════════════════════════════════════════════════════════════════
 
 pending_requests = {}  # request_id → Queue (for matching responses to requests)
-payload_store = {}     # request_id → gemini_body (for large payloads that exceed 1MB native messaging limit)
-HOST_PORT = 8765       # Set in main(), used by request handlers for payload fetch URLs
 
 MODEL_PATTERN = re.compile(r'^[A-Za-z0-9._-]+$')
 
@@ -325,10 +323,10 @@ def openai_to_gemini(body):
     Key conversions:
         - messages[] → contents[] with role mapping (user→user, assistant→model)
         - system message → systemInstruction
-        - temperature, max_tokens → generationConfig
+        - OpenAI sampling controls → generationConfig
         - tools[] → single tools[{functionDeclarations: [...]}] with UPPERCASE types
-        - tool_calls in assistant history → text description (Canvas key rejects functionCall parts)
-        - tool results → user message with [Tool result] prefix (Canvas key rejects function role)
+        - assistant tool_calls → native functionCall history parts
+        - tool results → native functionResponse parts in a user turn
     """
     contents = []
     system_instruction = None
@@ -772,16 +770,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self._json_response(200, {"object": "list", "data": models})
         elif self.path == '/health':
             self._json_response(200, {"status": "ok"})
-        elif self.path.startswith('/internal/payload/'):
-            # Internal endpoint for extension to fetch large payloads that
-            # exceed the 1MB native messaging limit. The extension service
-            # worker can fetch() from localhost without LNA restrictions.
-            req_id = self.path.split('/internal/payload/')[1]
-            body = payload_store.pop(req_id, None)
-            if body is not None:
-                self._json_response(200, body)
-            else:
-                self._json_error(404, "Payload not found or already consumed")
         else:
             self.send_error(404)
 
@@ -1043,9 +1031,7 @@ class APIHandler(BaseHTTPRequestHandler):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
-    global HOST_PORT
     port = int(os.environ.get('PROXY_PORT', '8765'))
-    HOST_PORT = port
 
     # --standalone mode: run HTTP server without native messaging
     # Useful for debugging or when the extension bridge isn't needed.

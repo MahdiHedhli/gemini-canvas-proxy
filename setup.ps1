@@ -51,8 +51,9 @@ Write-Host "4. Copy the Extension ID (32-char string below the extension name)"
 Write-Host ""
 $ExtensionId = Read-Host "Paste Extension ID"
 
-if ([string]::IsNullOrWhiteSpace($ExtensionId)) {
-    Write-Host "[ERROR] No extension ID provided." -ForegroundColor Red
+if ($ExtensionId -notmatch '^[a-p]{32}$') {
+    Write-Host "[ERROR] Invalid extension ID." -ForegroundColor Red
+    Write-Host "Chrome extension IDs must contain exactly 32 characters from a-p."
     exit 1
 }
 

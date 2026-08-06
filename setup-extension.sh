@@ -45,10 +45,9 @@ if [ -z "$EXTENSION_ID" ]; then
 fi
 
 if ! [[ "$EXTENSION_ID" =~ ^[a-p]{32}$ ]]; then
-    echo "WARNING: extension ID '$EXTENSION_ID' doesn't look like a valid 32-char ID" >&2
-    echo "(Chrome extension IDs are 32 chars from [a-p]; got $(echo -n "$EXTENSION_ID" | wc -c) chars)"
-    read -rp "Continue anyway? [y/N] " yn
-    [[ "$yn" =~ ^[Yy]$ ]] || exit 1
+    echo "ERROR: invalid extension ID" >&2
+    echo "Chrome extension IDs must contain exactly 32 characters from a-p." >&2
+    exit 1
 fi
 
 mkdir -p "$NATIVE_HOST_DIR"

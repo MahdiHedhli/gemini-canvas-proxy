@@ -471,7 +471,8 @@ gemini-canvas-proxy/
 
 - **Canvas tab must stay open** — closing it kills the proxy
 - **Model-scoped key** — only the currently promoted model works
-- **Large payloads** — payloads >900KB are automatically chunked into 800KB pieces across multiple native messaging messages (bypasses 1MB limit). No size limit in practice.
+- **Large payloads** — payloads >900KB are chunked across multiple native
+  messages so each message stays below Chrome's 1MB host-to-extension cap.
 - **No real streaming** — responses are buffered then sent as a single SSE chunk (but `tool_calls` are correctly emitted in streaming format with proper `finish_reason`)
 - **ToS risk** — using Canvas credentials outside Canvas may violate Google's Terms of Service
 - **Tool calling** — uses native Gemini function calling with `thoughtSignature` for history. Tool schemas are automatically sanitized to remove Gemini-incompatible JSON Schema fields

@@ -17,7 +17,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NATIVE_HOST_NAME="com.gemini.proxy"
 HOST_SCRIPT="$SCRIPT_DIR/native_host/gemini_proxy.py"
-HOST_MANIFEST_TEMPLATE="$SCRIPT_DIR/native_host/com.gemini.proxy.json"
 TOKEN_FILE="$SCRIPT_DIR/native_host/.proxy_token"
 
 # Sanity check: make sure we're in the right directory
@@ -48,8 +47,9 @@ echo "4. Copy the Extension ID (32-char string below the extension name)"
 echo ""
 read -p "Paste Extension ID: " EXTENSION_ID
 
-if [ -z "$EXTENSION_ID" ]; then
-    echo "✗ No extension ID provided. Aborting."
+if ! [[ "$EXTENSION_ID" =~ ^[a-p]{32}$ ]]; then
+    echo "✗ Invalid extension ID."
+    echo "  Chrome extension IDs must contain exactly 32 characters from a-p."
     exit 1
 fi
 
