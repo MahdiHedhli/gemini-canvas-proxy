@@ -10,16 +10,19 @@
  *   This service worker
  *       ↕ chrome.tabs.sendMessage
  *   Content script (in top-level Gemini page)
- *       ↕ postMessage
+ *       ↕ MessageChannel
  *   Canvas iframe (proxy page with free Gemini API key)
  *
  * The native host connects via chrome.runtime.connectNative().
  * Chrome starts the Python process and keeps it alive while the
  * port is open. If the Python process dies, we reconnect after 2s.
  *
- * Tab discovery: We look for any tab with "gemini" or "canvas" in
- * the URL. We also listen for page_ready messages from the content
- * script, which fires when the Canvas proxy page loads.
+ * Tab discovery: We look for tabs on the exact Gemini origin. We
+ * also listen for page_ready messages from the content script, which
+ * fires when the Canvas proxy page loads.
+ *
+ * MV3 state: canvas-tab selection and partial chunk buffers live in
+ * chrome.storage.session so they survive service-worker suspension.
  */
 
 let nativePort = null;
@@ -91,6 +94,24 @@ function connectNative() {
 
 // ── API request forwarding ───────────────────────────────────────────────────
 
+function decodeBase64Chunks(chunks) {
+    const decoded = chunks.map((chunk) => {
+        const binary = atob(chunk);
+        return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+    });
+    const totalBytes = decoded.reduce((total, chunk) => total + chunk.length, 0);
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of decoded) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return {
+        json: new TextDecoder('utf-8', { fatal: true }).decode(combined),
+        byteLength: totalBytes
+    };
+}
+
 async function addChunk(msg) {
     if (
         !Number.isInteger(msg.total_chunks)
@@ -101,6 +122,9 @@ async function addChunk(msg) {
         || msg.chunk_index >= msg.total_chunks
     ) {
         throw new Error('Invalid chunk metadata');
+    }
+    if (msg.chunk_encoding !== 'base64') {
+        throw new Error('Unsupported chunk encoding');
     }
     const key = CHUNK_KEY_PREFIX + msg.id;
     const stored = await chrome.storage.session.get(key);
@@ -124,7 +148,20 @@ async function addChunk(msg) {
 async function handleApiRequest(msg) {
     // Handle chunked payloads (>1MB native messaging limit)
     if (msg.type === 'api_request_chunk') {
-        const { key, buffer: buf } = await addChunk(msg);
+        let key, buf;
+        try {
+            ({ key, buffer: buf } = await addChunk(msg));
+        } catch (e) {
+            console.error('[Proxy] Chunk rejected:', e.message);
+            if (nativePort) {
+                nativePort.postMessage({
+                    type: 'api_response',
+                    id: msg.id,
+                    error: e.message
+                });
+            }
+            return;
+        }
 
         // Check if all chunks received
         const received = buf.chunks.filter(c => c !== undefined).length;
@@ -133,12 +170,12 @@ async function handleApiRequest(msg) {
         if (received < buf.total) return; // Wait for more chunks
 
         // All chunks received — reassemble
-        const fullJson = buf.chunks.join('');
         await chrome.storage.session.remove(key);
-        console.log('[Proxy] All chunks reassembled, size:', fullJson.length, 'bytes');
 
         try {
-            msg = JSON.parse(fullJson);
+            const reassembled = decodeBase64Chunks(buf.chunks);
+            console.log('[Proxy] All chunks reassembled, size:', reassembled.byteLength, 'bytes');
+            msg = JSON.parse(reassembled.json);
         } catch (e) {
             console.error('[Proxy] Failed to parse reassembled payload:', e);
             if (nativePort) {
@@ -162,16 +199,6 @@ async function handleApiRequest(msg) {
             nativePort.postMessage({ type: 'api_response', id: msg.id, error: err });
         }
         return;
-    }
-
-    // Programmatically inject content script (in case it wasn't auto-injected)
-    try {
-        await chrome.scripting.executeScript({
-            target: { tabId: canvasState.tabId, allFrames: true },
-            files: ['content_script.js']
-        });
-    } catch (e) {
-        // Already injected or sandbox restriction — that's OK
     }
 
     // Forward the API request to the content script
@@ -224,7 +251,22 @@ async function discoverCanvasTab() {
 
 // ── Message listeners (from content script) ──────────────────────────────────
 
+function isTrustedGeminiSender(sender) {
+    if (!sender.tab || !Number.isInteger(sender.tab.id) || !sender.url) return false;
+    try {
+        return new URL(sender.url).origin === 'https://gemini.google.com';
+    } catch (e) {
+        return false;
+    }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!isTrustedGeminiSender(sender)) {
+        console.warn('[Proxy] Rejected message from untrusted sender');
+        sendResponse({ ok: false, error: 'Untrusted sender' });
+        return false;
+    }
+
     if (message.type === 'page_ready') {
         (async () => {
             await setCanvasState(sender.tab.id, true);
@@ -241,15 +283,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'api_response') {
-        if (nativePort) {
-            nativePort.postMessage({
-                type: 'api_response',
-                id: message.id,
-                status: message.status,
-                data: message.data,
-                error: message.error
-            });
-        }
+        (async () => {
+            const state = await getCanvasState();
+            if (sender.tab.id !== state.tabId) {
+                console.warn('[Proxy] Rejected response from inactive Gemini tab');
+                sendResponse({ ok: false, error: 'Inactive Gemini tab' });
+                return;
+            }
+            if (nativePort) {
+                nativePort.postMessage({
+                    type: 'api_response',
+                    id: message.id,
+                    status: message.status,
+                    data: message.data,
+                    error: message.error
+                });
+            }
+            sendResponse({ ok: true });
+        })().catch((error) => {
+            console.error('[Proxy] api_response handling failed:', error);
+            sendResponse({ ok: false, error: error.message });
+        });
+        return true;
     }
 
     return true; // Keep message channel open for async responses

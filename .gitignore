@@ -1,5 +1,6 @@
 # Auto-generated, do not edit
 native_host/com.gemini.proxy.json
+native_host/.proxy_token
 native_host/__pycache__/
 
 # Docker build artefacts (never committed)
