@@ -329,6 +329,8 @@ const html = htm.bind(React.createElement);
 // the real API key at compile time. DO NOT modify this line.
 // ═══════════════════════════════════════════════════════════════
 const apiKey = "";
+const allowedApiPath = /^\/v1beta\/models\/([A-Za-z0-9._-]+):(generateContent|streamGenerateContent)$/;
+const geminiApiOrigin = 'https://generativelanguage.googleapis.com';
 
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -364,14 +366,38 @@ function App() {
             var path = data.path;
             var body = data.body;
             var headers = data.headers;
-            addLog('request', method + ' ' + path.replace('/v1beta/models/', '').replace(':generateContent', ''));
 
-            var url = 'https://generativelanguage.googleapis.com' + path;
-            if (apiKey) {
-                url += (url.indexOf('?') >= 0 ? '&' : '?') + 'key=' + encodeURIComponent(apiKey);
+            var pathMatch = typeof path === 'string' ? path.match(allowedApiPath) : null;
+            if (!pathMatch || pathMatch[1].indexOf('..') !== -1) {
+                var pathError = 'Rejected invalid Gemini API path';
+                addLog('error', pathError, 'error');
+                window.parent.postMessage({
+                    source: 'gemini-proxy-response',
+                    id: id,
+                    error: pathError
+                }, '*');
+                return;
             }
 
-            fetch(url, {
+            addLog('request', method + ' ' + path.replace('/v1beta/models/', '').replace(':generateContent', ''));
+
+            var parsedUrl = new URL(path, geminiApiOrigin);
+            if (parsedUrl.protocol !== 'https:' ||
+                parsedUrl.hostname !== 'generativelanguage.googleapis.com') {
+                var originError = 'Rejected non-Gemini API destination';
+                addLog('error', originError, 'error');
+                window.parent.postMessage({
+                    source: 'gemini-proxy-response',
+                    id: id,
+                    error: originError
+                }, '*');
+                return;
+            }
+            if (apiKey) {
+                parsedUrl.searchParams.set('key', apiKey);
+            }
+
+            fetch(parsedUrl.toString(), {
                 method: method,
                 headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}),
                 body: body ? JSON.stringify(body) : undefined

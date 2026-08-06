@@ -40,6 +40,7 @@ import json
 import threading
 import uuid
 import os
+import re
 import hmac
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -92,6 +93,17 @@ pending_requests = {}  # request_id → Queue (for matching responses to request
 payload_store = {}     # request_id → gemini_body (for large payloads that exceed 1MB native messaging limit)
 HOST_PORT = 8765       # Set in main(), used by request handlers for payload fetch URLs
 
+MODEL_PATTERN = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def _is_valid_model(model):
+    return (
+        isinstance(model, str)
+        and bool(MODEL_PATTERN.fullmatch(model))
+        and '..' not in model
+    )
+
+
 DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
 
@@ -112,7 +124,6 @@ def _load_proxy_token():
             return token_file.read().strip()
     except OSError:
         return ''
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FORMAT TRANSLATION: OpenAI Chat Completions → Gemini generateContent
@@ -539,6 +550,12 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         model = body.get('model', 'gemini-3-flash-preview')
+        if not _is_valid_model(model):
+            self._json_error(
+                400,
+                "Invalid model identifier; use only letters, numbers, '.', '_', and '-'"
+            )
+            return
         gemini_body = openai_to_gemini(body)
         stream = body.get('stream', False)
 
