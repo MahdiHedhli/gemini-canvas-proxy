@@ -329,6 +329,8 @@ const html = htm.bind(React.createElement);
 // the real API key at compile time. DO NOT modify this line.
 // ═══════════════════════════════════════════════════════════════
 const apiKey = "";
+const allowedApiPath = /^\/v1beta\/models\/([A-Za-z0-9._-]+):(generateContent|streamGenerateContent)$/;
+const geminiApiOrigin = 'https://generativelanguage.googleapis.com';
 
 const { useState, useEffect, useRef, useCallback } = React;
 
@@ -337,27 +339,6 @@ function App() {
     const [logs, setLogs] = useState([]);
     const [stats, setStats] = useState({ total: 0, success: 0, errors: 0 });
     const logEndRef = useRef(null);
-
-    // ── Request deduplication ──────────────────────────────────────────
-    // The content script posts to ALL iframes + main window for reliability
-    // (sandbox cross-origin makes iframe targeting unreliable). This means
-    // we may receive the same request multiple times. We track seen IDs and
-    // skip duplicates. Entries expire after 30 seconds.
-    var seenRequests = useRef({});
-    var seenCleanupTimer = useRef(null);
-
-    // Clean up seen request IDs every 30 seconds
-    useEffect(function() {
-        seenCleanupTimer.current = setInterval(function() {
-            var now = Date.now();
-            Object.keys(seenRequests.current).forEach(function(key) {
-                if (now - seenRequests.current[key] > 30000) {
-                    delete seenRequests.current[key];
-                }
-            });
-        }, 30000);
-        return function() { clearInterval(seenCleanupTimer.current); };
-    }, []);
 
     const addLog = useCallback((indicator, text, type) => {
         type = type || 'info';
@@ -374,39 +355,49 @@ function App() {
     }, [logs]);
 
     useEffect(function() {
-        var timer = setTimeout(function() {
-            window.parent.postMessage({ source: 'gemini-proxy-ready' }, '*');
-            setStatus('online');
-            addLog('info', 'Proxy ready — waiting for requests', 'info');
-        }, 500);
-        return function() { clearTimeout(timer); };
-    }, [addLog]);
+        var channel = new MessageChannel();
 
-    useEffect(function() {
         function handleMessage(event) {
             var data = event.data;
             if (!data || data.source !== 'gemini-proxy-request') return;
 
             var id = data.id;
-
-            // ── Deduplicate: skip if we've already seen this request ID ──
-            // The content script posts to all iframes + main window, so we
-            // receive the same request multiple times. Only process the first.
-            if (seenRequests.current[id]) return;
-            seenRequests.current[id] = Date.now();
-
             var method = data.method || 'POST';
             var path = data.path;
             var body = data.body;
             var headers = data.headers;
-            addLog('request', method + ' ' + path.replace('/v1beta/models/', '').replace(':generateContent', ''));
 
-            var url = 'https://generativelanguage.googleapis.com' + path;
-            if (apiKey) {
-                url += (url.indexOf('?') >= 0 ? '&' : '?') + 'key=' + encodeURIComponent(apiKey);
+            var pathMatch = typeof path === 'string' ? path.match(allowedApiPath) : null;
+            if (!pathMatch || pathMatch[1].indexOf('..') !== -1) {
+                var pathError = 'Rejected invalid Gemini API path';
+                addLog('error', pathError, 'error');
+                window.parent.postMessage({
+                    source: 'gemini-proxy-response',
+                    id: id,
+                    error: pathError
+                }, '*');
+                return;
             }
 
-            fetch(url, {
+            addLog('request', method + ' ' + path.replace('/v1beta/models/', '').replace(':generateContent', ''));
+
+            var parsedUrl = new URL(path, geminiApiOrigin);
+            if (parsedUrl.protocol !== 'https:' ||
+                parsedUrl.hostname !== 'generativelanguage.googleapis.com') {
+                var originError = 'Rejected non-Gemini API destination';
+                addLog('error', originError, 'error');
+                window.parent.postMessage({
+                    source: 'gemini-proxy-response',
+                    id: id,
+                    error: originError
+                }, '*');
+                return;
+            }
+            if (apiKey) {
+                parsedUrl.searchParams.set('key', apiKey);
+            }
+
+            fetch(parsedUrl.toString(), {
                 method: method,
                 headers: Object.assign({ 'Content-Type': 'application/json' }, headers || {}),
                 body: body ? JSON.stringify(body) : undefined
@@ -415,22 +406,31 @@ function App() {
                     response.status + ' ' + (response.ok ? 'OK' : (response.statusText || 'Error')),
                     response.ok ? 'success' : 'error');
                 return response.json().catch(function() { return {}; }).then(function(respData) {
-                    window.parent.postMessage({
+                    channel.port1.postMessage({
                         source: 'gemini-proxy-response',
                         id: id,
                         status: response.status,
                         data: respData,
                         error: response.ok ? null : 'API ' + response.status
-                    }, '*');
+                    });
                 });
             }).catch(function(err) {
                 addLog('error', err.message, 'error');
-                window.parent.postMessage({ source: 'gemini-proxy-response', id: id, error: err.message }, '*');
+                channel.port1.postMessage({ source: 'gemini-proxy-response', id: id, error: err.message });
             });
         }
 
-        window.addEventListener('message', handleMessage);
-        return function() { window.removeEventListener('message', handleMessage); };
+        channel.port1.onmessage = handleMessage;
+        channel.port1.start();
+        var timer = setTimeout(function() {
+            window.parent.postMessage({ source: 'gemini-proxy-ready' }, '*', [channel.port2]);
+            setStatus('online');
+            addLog('info', 'Proxy ready — waiting for requests', 'info');
+        }, 500);
+        return function() {
+            clearTimeout(timer);
+            channel.port1.close();
+        };
     }, [addLog]);
 
     var sc = {
@@ -446,7 +446,7 @@ function App() {
                     <div className="header-icon">⚡</div>
                     <h1>Gemini Canvas Proxy</h1>
                 </div>
-                <p>Free unlimited Gemini API via Canvas postMessage bridge</p>
+                <p>Free unlimited Gemini API via Canvas MessageChannel bridge</p>
             </div>
 
             <div className=${'status-bar ' + status}>
@@ -498,7 +498,7 @@ function App() {
             </div>
 
             <div className="footer">
-                <a href="https://github.com/pranrichh/gemini-canvas-proxy" target="_blank">gemini-canvas-proxy</a> · postMessage bridge · no WebSocket · no LNA issues
+                <a href="https://github.com/pranrichh/gemini-canvas-proxy" target="_blank">gemini-canvas-proxy</a> · MessageChannel bridge · no WebSocket · no LNA issues
             </div>
         </div>
     `;

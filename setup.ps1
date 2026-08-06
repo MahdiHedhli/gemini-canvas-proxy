@@ -10,6 +10,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $NativeHostName = "com.gemini.proxy"
 $HostScript = Join-Path $ScriptDir "native_host\gemini_proxy.py"
 $HostScriptWin = $HostScript -replace "/", "\"
+$TokenFile = Join-Path $ScriptDir "native_host\.proxy_token"
 
 Write-Host ""
 Write-Host "==================================================" -ForegroundColor Cyan
@@ -30,6 +31,14 @@ if (-not $pythonExe) {
 # Get the full path to python.exe (resolve any aliases)
 $PythonPath = (Get-Command python).Source
 Write-Host "[OK] Python found: $PythonPath" -ForegroundColor Green
+
+if (-not (Test-Path $TokenFile) -or [string]::IsNullOrWhiteSpace((Get-Content $TokenFile -Raw))) {
+    $ProxyToken = [guid]::NewGuid().ToString()
+    Set-Content -Path $TokenFile -Value $ProxyToken -NoNewline -Encoding ASCII
+} else {
+    $ProxyToken = (Get-Content $TokenFile -Raw).Trim()
+}
+Write-Host "[OK] Bearer token written to $TokenFile" -ForegroundColor Green
 
 # ── Step 2: Get extension ID ────────────────────────────────────────────────
 
@@ -129,7 +138,10 @@ Write-Host "  6. Paste into Canvas code editor"
 Write-Host "  7. Click Preview - you should see the proxy UI"
 Write-Host ""
 Write-Host "  8. Test:"
-Write-Host '     curl http://127.0.0.1:8765/v1/chat/completions -H "Content-Type: application/json" -d "{\"model\":\"gemini-3-flash-preview\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello!\"}]}"'
+Write-Host "     curl http://127.0.0.1:8765/v1/chat/completions -H `"Authorization: Bearer $ProxyToken`" -H `"Content-Type: application/json`" -d `"{\`"model\`":\`"gemini-3-flash-preview\`",\`"messages\`":[{\`"role\`":\`"user\`",\`"content\`":\`"Hello!\`"}]}`""
+Write-Host ""
+Write-Host "  Bearer token: $ProxyToken"
+Write-Host "  Keep this token private; clients must send it as their API key."
 Write-Host ""
 Write-Host "  9. See README.md for integration with Hermes, OpenClaw, etc."
 Write-Host ""
