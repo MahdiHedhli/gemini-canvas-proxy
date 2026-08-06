@@ -1,6 +1,6 @@
 # ⚡ Gemini Canvas Proxy
 
-**Free unlimited Gemini API via Canvas + Chrome extension bridge. No WebSocket, no Local Network Access issues — uses `postMessage` which bypasses Chrome 142+ restrictions entirely.**
+**Free unlimited Gemini API via Canvas + Chrome extension bridge. No WebSocket or Local Network Access issues — uses a private `MessageChannel` instead of a network connection.**
 
 [![Models](https://img.shields.io/badge/models-4%20working-blue)](#available-models)
 
@@ -28,8 +28,8 @@ Chrome Extension (service worker)         ← Routes to the Gemini tab
     ▼
 Content Script (top-level Gemini page)    ← Relay between extension and iframe
     │
-    ├── window.postMessage                ← Works across sandbox boundaries!
-    │                                      (NOT a network call — never blocked)
+    ├── MessageChannel                    ← Private port transferred once via
+    │                                      postMessage across the sandbox boundary
     ▼
 Canvas Proxy Page (in sandboxed iframe)   ← fetch() to Gemini API (FREE)
     │
@@ -44,7 +44,10 @@ Response flows back the same path → HTTP response to your app
 
 **CanvasToAPI** and similar projects use WebSocket (`ws://localhost:port`) to bridge between the Canvas page and a local server. Chrome 142+ [Local Network Access](https://developers.google.com/privacy-sandbox/blog/local-network-access) blocks these connections from sandboxed iframes — requiring users to disable `chrome://flags/#local-network-access-check`, which is disappearing in Chrome 145+.
 
-**This project uses `postMessage` instead** — a browser-level IPC mechanism that works across sandbox boundaries without any network calls. Chrome cannot block it because it's not a network request. This makes the proxy future-proof.
+**This project uses a `MessageChannel` instead** — browser-level IPC that works
+across the Canvas sandbox boundary without a local network request. The Canvas page
+transfers a private port during a one-time `postMessage` handshake; API requests and
+responses then travel only over that port.
 
 ### How Canvas Auth Works
 
@@ -360,7 +363,7 @@ gemini-canvas-proxy/
 ├── extension/
 │   ├── manifest.json          # Chrome MV3 extension manifest
 │   ├── background.js          # Service worker: native host ↔ content script
-│   └── content_script.js      # PostMessage relay: iframe ↔ extension
+│   └── content_script.js      # MessageChannel relay: iframe ↔ extension
 ├── native_host/
 │   └── gemini_proxy.py        # HTTP server (:8765) + OpenAI↔Gemini translation
 ├── setup.sh                   # Setup script (Linux / macOS)
