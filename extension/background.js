@@ -10,15 +10,15 @@
  *   This service worker
  *       ↕ chrome.tabs.sendMessage
  *   Content script (in top-level Gemini page)
- *       ↕ postMessage
+ *       ↕ MessageChannel
  *   Canvas iframe (proxy page with free Gemini API key)
  *
  * The native host connects via chrome.runtime.connectNative().
  * Chrome starts the Python process and keeps it alive while the
  * port is open. If the Python process dies, we reconnect after 2s.
  *
- * Tab discovery: We look for any tab with "gemini" or "canvas" in
- * the URL. We also listen for page_ready messages from the content
+ * Tab discovery: We look for tabs on the exact Gemini origin. We
+ * also listen for page_ready messages from the content
  * script, which fires when the Canvas proxy page loads.
  */
 
@@ -134,16 +134,6 @@ async function handleApiRequest(msg) {
         return;
     }
 
-    // Programmatically inject content script (in case it wasn't auto-injected)
-    try {
-        await chrome.scripting.executeScript({
-            target: { tabId: canvasTabId, allFrames: true },
-            files: ['content_script.js']
-        });
-    } catch (e) {
-        // Already injected or sandbox restriction — that's OK
-    }
-
     // Forward the API request to the content script
     try {
         await chrome.tabs.sendMessage(canvasTabId, {
@@ -173,13 +163,14 @@ function discoverCanvasTab() {
         chrome.tabs.query({}, (tabs) => {
             for (const tab of tabs) {
                 if (!tab.url) continue;
-                const url = tab.url.toLowerCase();
-                // Match various Gemini URLs (gemini.google.com/app, etc.)
-                if (url.includes('gemini.google.com')) {
+                try {
+                    if (new URL(tab.url).origin !== 'https://gemini.google.com') continue;
                     canvasTabId = tab.id;
                     console.log('[Proxy] Found Gemini tab:', canvasTabId, tab.url.substring(0, 60));
                     resolve(tab.id);
                     return;
+                } catch (e) {
+                    continue;
                 }
             }
             console.warn('[Proxy] No Gemini tab found among', tabs.length, 'tabs');
@@ -191,7 +182,22 @@ function discoverCanvasTab() {
 
 // ── Message listeners (from content script) ──────────────────────────────────
 
+function isTrustedGeminiSender(sender) {
+    if (!sender.tab || !Number.isInteger(sender.tab.id) || !sender.url) return false;
+    try {
+        return new URL(sender.url).origin === 'https://gemini.google.com';
+    } catch (e) {
+        return false;
+    }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (!isTrustedGeminiSender(sender)) {
+        console.warn('[Proxy] Rejected message from untrusted sender');
+        sendResponse({ ok: false, error: 'Untrusted sender' });
+        return false;
+    }
+
     if (message.type === 'page_ready') {
         canvasTabId = sender.tab.id;
         console.log('[Proxy] Canvas proxy page ready, tab:', canvasTabId);
@@ -202,6 +208,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.type === 'api_response') {
+        if (sender.tab.id !== canvasTabId) {
+            console.warn('[Proxy] Rejected response from inactive Gemini tab');
+            sendResponse({ ok: false, error: 'Inactive Gemini tab' });
+            return false;
+        }
         if (nativePort) {
             nativePort.postMessage({
                 type: 'api_response',
@@ -220,8 +231,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     if (tab.url) {
-        const url = tab.url.toLowerCase();
-        if (url.includes('gemini.google.com')) {
+        let isGemini = false;
+        try {
+            isGemini = new URL(tab.url).origin === 'https://gemini.google.com';
+        } catch (e) {
+            // Ignore malformed and non-HTTP tab URLs.
+        }
+        if (isGemini) {
             canvasTabId = tabId;
         } else if (tabId === canvasTabId) {
             canvasTabId = null;

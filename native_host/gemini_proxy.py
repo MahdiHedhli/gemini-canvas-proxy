@@ -41,6 +41,12 @@ import threading
 import uuid
 import os
 import base64
+import ipaddress
+import socket
+import urllib.parse
+import urllib.request
+import re
+import hmac
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from queue import Queue, Empty
@@ -131,6 +137,175 @@ pending_requests = {}  # request_id → Queue (for matching responses to request
 payload_store = {}     # request_id → gemini_body (for large payloads that exceed 1MB native messaging limit)
 HOST_PORT = 8765       # Set in main(), used by request handlers for payload fetch URLs
 
+MODEL_PATTERN = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def _is_valid_model(model):
+    return (
+        isinstance(model, str)
+        and bool(MODEL_PATTERN.fullmatch(model))
+        and '..' not in model
+    )
+
+
+DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
+
+def _token_file_path():
+    return os.environ.get(
+        'PROXY_TOKEN_FILE',
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '.proxy_token')
+    )
+
+
+def _load_proxy_token():
+    """Load the bearer token from the environment or a mode-600 token file."""
+    token = os.environ.get('PROXY_TOKEN', '').strip()
+    if token:
+        return token
+    try:
+        with open(_token_file_path(), 'r', encoding='utf-8') as token_file:
+            return token_file.read().strip()
+    except OSError:
+        return ''
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REMOTE IMAGE FETCHING
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ImageFetchError(ValueError):
+    """A remote image was rejected or could not be fetched safely."""
+
+
+def _url_fetch_enabled():
+    return os.environ.get('PROXY_ALLOW_URL_FETCH', '').lower() in {
+        '1', 'true', 'yes', 'on'
+    }
+
+
+def _validate_public_image_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {'http', 'https'}:
+        raise ImageFetchError("only HTTP and HTTPS URLs are supported")
+    if not parsed.hostname or parsed.username or parsed.password:
+        raise ImageFetchError("URL authority is invalid")
+
+    try:
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    except ValueError as exc:
+        raise ImageFetchError("URL port is invalid") from exc
+
+    try:
+        addresses = socket.getaddrinfo(
+            parsed.hostname,
+            port,
+            type=socket.SOCK_STREAM
+        )
+    except socket.gaierror as exc:
+        raise ImageFetchError(f"hostname resolution failed: {exc}") from exc
+
+    if not addresses:
+        raise ImageFetchError("hostname did not resolve")
+
+    for address_info in addresses:
+        address = ipaddress.ip_address(address_info[4][0])
+        if (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_unspecified
+            or address.is_multicast
+            or not address.is_global
+        ):
+            raise ImageFetchError("destination resolves to a non-public address")
+    return parsed
+
+
+class _PublicOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Apply the destination policy again before following every redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_public_image_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _fetch_remote_image(url):
+    if not _url_fetch_enabled():
+        raise ImageFetchError(
+            "remote URL fetching is disabled; use a data URI or set "
+            "PROXY_ALLOW_URL_FETCH=true"
+        )
+
+    _validate_public_image_url(url)
+    try:
+        max_bytes = int(os.environ.get(
+            'PROXY_MAX_IMAGE_BYTES',
+            str(20 * 1024 * 1024)
+        ))
+    except ValueError as exc:
+        raise ImageFetchError("PROXY_MAX_IMAGE_BYTES must be an integer") from exc
+    if max_bytes <= 0:
+        raise ImageFetchError("PROXY_MAX_IMAGE_BYTES must be positive")
+
+    request = urllib.request.Request(
+        url,
+        headers={'User-Agent': 'GeminiCanvasProxy/1.0'}
+    )
+    opener = urllib.request.build_opener(_PublicOnlyRedirectHandler())
+
+    try:
+        with opener.open(request, timeout=15) as response:
+            content_type = response.headers.get(
+                'Content-Type',
+                'application/octet-stream'
+            ).split(';', 1)[0].strip().lower()
+            if not content_type.startswith('image/'):
+                raise ImageFetchError(
+                    f"response content type is not an image ({content_type})"
+                )
+
+            declared_length = response.headers.get('Content-Length')
+            if declared_length:
+                try:
+                    declared_bytes = int(declared_length)
+                except ValueError as exc:
+                    raise ImageFetchError(
+                        "response Content-Length is invalid"
+                    ) from exc
+                if declared_bytes > max_bytes:
+                    raise ImageFetchError(
+                        f"image exceeds the {max_bytes}-byte limit"
+                    )
+
+            chunks = []
+            received = 0
+            while True:
+                chunk = response.read(min(64 * 1024, max_bytes - received + 1))
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > max_bytes:
+                    raise ImageFetchError(
+                        f"image exceeds the {max_bytes}-byte limit"
+                    )
+                chunks.append(chunk)
+    except ImageFetchError:
+        raise
+    except Exception as exc:
+        raise ImageFetchError(f"fetch failed: {exc}") from exc
+
+    return content_type, base64.b64encode(b''.join(chunks)).decode('ascii')
+
+
+def _log_dropped_image(url, reason):
+    try:
+        host = urllib.parse.urlsplit(url).hostname or '<invalid-host>'
+    except ValueError:
+        host = '<invalid-host>'
+    sys.stderr.write(f"[Proxy] Dropped remote image from {host}: {reason}\n")
+    sys.stderr.flush()
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FORMAT TRANSLATION: OpenAI Chat Completions → Gemini generateContent
@@ -164,12 +339,10 @@ def openai_to_gemini(body):
         # ── Assistant messages with tool_calls ────────────────────────────
         # Send native functionCall parts in history. Gemini 3 requires a
         # thoughtSignature on functionCall parts for validation.
-        # CanvasToAPI uses a dummy signature that passes validation.
         if role == 'assistant' and msg.get('tool_calls'):
             parts = []
             if content:
                 parts.append({"text": content})
-            signature_added = False
             for tc in msg.get('tool_calls', []):
                 func = tc.get('function', {})
                 args_str = func.get('arguments', '{}')
@@ -177,11 +350,22 @@ def openai_to_gemini(body):
                     args_parsed = json.loads(args_str)
                 except Exception:
                     args_parsed = {}
-                fc_part = {"functionCall": {"name": func.get('name', ''), "args": args_parsed}}
-                # Gemini 3 requires thoughtSignature on the first functionCall
-                if not signature_added:
-                    fc_part["thoughtSignature"] = "context_engineering_is_the_way_to_go"
-                    signature_added = True
+                fc_part = {
+                    "functionCall": {
+                        "name": func.get('name', ''),
+                        "args": args_parsed
+                    }
+                }
+                signature = tc.get('x_gemini_thought_signature')
+                if not signature:
+                    signature = "context_engineering_is_the_way_to_go"
+                    sys.stderr.write(
+                        "[Proxy] WARNING: Missing Gemini thoughtSignature for "
+                        f"function call {func.get('name', '<unnamed>')}; "
+                        "using compatibility fallback\n"
+                    )
+                    sys.stderr.flush()
+                fc_part["thoughtSignature"] = signature
                 parts.append(fc_part)
             contents.append({"role": "model", "parts": parts})
             continue
@@ -236,25 +420,25 @@ def openai_to_gemini(body):
                         meta, b64 = url.split(',', 1)
                         mime = meta.split(';')[0].split(':')[1] if ':' in meta else 'image/jpeg'
                         parts.append({"inlineData": {"mimeType": mime, "data": b64}})
-                    elif url.startswith('http'):
+                    elif url.startswith(('http://', 'https://')):
                         # HTTP URL: fetch the image server-side, convert to inlineData
                         # This is necessary because Canvas can't fetch arbitrary URLs,
                         # and Gemini's fileData requires a separate upload step that
                         # the Canvas key may not support.
                         try:
-                            import urllib.request
-                            req = urllib.request.Request(url, headers={'User-Agent': 'GeminiCanvasProxy/1.0'})
-                            with urllib.request.urlopen(req, timeout=15) as resp:
-                                img_data = resp.read()
-                                content_type = resp.headers.get('Content-Type', 'image/jpeg')
-                                # Only process if it's actually an image
-                                if content_type.startswith('image/'):
-                                    import base64
-                                    b64 = base64.b64encode(img_data).decode('utf-8')
-                                    parts.append({"inlineData": {"mimeType": content_type, "data": b64}})
-                        except Exception:
-                            # Silently skip failed fetches — don't break the entire request
-                            pass
+                            content_type, b64 = _fetch_remote_image(url)
+                            parts.append({
+                                "inlineData": {
+                                    "mimeType": content_type,
+                                    "data": b64
+                                }
+                            })
+                        except ImageFetchError as exc:
+                            reason = str(exc)
+                            _log_dropped_image(url, reason)
+                            parts.append({
+                                "text": f"[Remote image omitted: {reason}]"
+                            })
             if parts:
                 # Check total payload size for the 1MB native messaging limit
                 try:
@@ -378,6 +562,36 @@ def _sanitize_schema_for_gemini(obj):
 # FORMAT TRANSLATION: Gemini generateContent → OpenAI Chat Completions
 # ═══════════════════════════════════════════════════════════════════════════
 
+class GeminiResponseError(ValueError):
+    """Gemini returned no usable completion."""
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+FINISH_REASON_MAP = {
+    'STOP': 'stop',
+    'MAX_TOKENS': 'length',
+    'SAFETY': 'content_filter',
+    'RECITATION': 'content_filter',
+    'BLOCKLIST': 'content_filter',
+    'PROHIBITED_CONTENT': 'content_filter',
+}
+
+
+def _map_finish_reason(reason):
+    normalized = str(reason or 'STOP').upper()
+    mapped = FINISH_REASON_MAP.get(normalized)
+    if mapped:
+        return mapped
+    sys.stderr.write(
+        f"[Proxy] WARNING: Unmapped Gemini finishReason {normalized}; using stop\n"
+    )
+    sys.stderr.flush()
+    return 'stop'
+
+
 def gemini_to_openai(gemini_response, model):
     """
     Convert a Gemini API response to OpenAI chat completion format.
@@ -392,57 +606,77 @@ def gemini_to_openai(gemini_response, model):
     image_parts = []
     finish_reason = "stop"
 
-    if candidates:
-        candidate = candidates[0]
-        parts = candidate.get('content', {}).get('parts', [])
-
-        # Extract text, images, and function calls from parts
-        tool_calls = []
-        for p in parts:
-            if 'text' in p:
-                text_parts.append(p['text'])
-            elif 'inlineData' in p:
-                # Image generation models return images as inlineData
-                img_data = p['inlineData'].get('data', '')
-                mime = p['inlineData'].get('mimeType', 'image/png')
-                image_parts.append(f"![generated_image](data:{mime};base64,{img_data})")
-
-        # Check for function calls
-        for p in parts:
-            if 'functionCall' in p:
-                fc = p['functionCall']
-                tool_calls.append({
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {
-                        "name": fc.get('name', ''),
-                        "arguments": json.dumps(fc.get('args', {}))
-                    }
-                })
-
-        finish_reason = candidate.get('finishReason', 'stop').lower()
-        if finish_reason == 'max_tokens':
-            finish_reason = 'length'
-
-        # Combine text and image parts into content
-        content = '\n'.join(text_parts + image_parts) or None
-
-        if tool_calls:
-            return {
-                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
-                "object": "chat.completion",
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": content,
-                        "tool_calls": tool_calls
-                    },
-                    "finish_reason": "tool_calls"
-                }],
-                "usage": _extract_usage(gemini_response)
+    if not candidates:
+        feedback = gemini_response.get('promptFeedback', {})
+        block_reason = feedback.get('blockReason', 'UNKNOWN')
+        raise GeminiResponseError(
+            f"Gemini returned no candidates (block reason: {block_reason})",
+            {
+                "blockReason": block_reason,
+                "safetyRatings": feedback.get('safetyRatings', [])
             }
+        )
+
+    candidate = candidates[0]
+    parts = candidate.get('content', {}).get('parts', [])
+    raw_finish_reason = candidate.get('finishReason', 'STOP')
+    finish_reason = _map_finish_reason(raw_finish_reason)
+    if not parts and str(raw_finish_reason).upper() != 'STOP':
+        raise GeminiResponseError(
+            "Gemini returned no content "
+            f"(finish reason: {str(raw_finish_reason).upper()})",
+            {
+                "finishReason": str(raw_finish_reason).upper(),
+                "safetyRatings": candidate.get('safetyRatings', [])
+            }
+        )
+
+    # Extract text, images, and function calls from parts
+    tool_calls = []
+    for p in parts:
+        if 'text' in p:
+            text_parts.append(p['text'])
+        elif 'inlineData' in p:
+            # Image generation models return images as inlineData
+            img_data = p['inlineData'].get('data', '')
+            mime = p['inlineData'].get('mimeType', 'image/png')
+            image_parts.append(f"![generated_image](data:{mime};base64,{img_data})")
+
+    # Check for function calls
+    for p in parts:
+        if 'functionCall' in p:
+            fc = p['functionCall']
+            tool_call = {
+                "id": f"call_{uuid.uuid4().hex[:8]}",
+                "type": "function",
+                "function": {
+                    "name": fc.get('name', ''),
+                    "arguments": json.dumps(fc.get('args', {}))
+                }
+            }
+            if p.get('thoughtSignature'):
+                tool_call["x_gemini_thought_signature"] = p["thoughtSignature"]
+            tool_calls.append(tool_call)
+
+    # Combine text and image parts into content
+    content = '\n'.join(text_parts + image_parts) or None
+
+    if tool_calls:
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": _extract_usage(gemini_response)
+        }
 
     content = '\n'.join(text_parts + image_parts) or ""
 
@@ -477,12 +711,16 @@ class APIHandler(BaseHTTPRequestHandler):
     """HTTP handler exposing OpenAI-compatible endpoints."""
 
     def do_POST(self):
+        if self.path.startswith('/v1/') and not self._require_bearer_token():
+            return
         if self.path == '/v1/chat/completions':
             self._handle_chat_completions()
         else:
             self.send_error(404)
 
     def do_GET(self):
+        if self.path.startswith('/v1/') and not self._require_bearer_token():
+            return
         if self.path == '/v1/models':
             models = [
                 {"id": "gemini-3-flash-preview", "object": "model", "owned_by": "google", "description": "Gemini 3 Flash — fast, capable, great for agents"},
@@ -507,22 +745,58 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
+        request_origin = self.headers.get('Origin')
+        allowed_origin = os.environ.get('PROXY_ALLOWED_ORIGIN', '').strip()
+        if request_origin and request_origin != allowed_origin:
+            self._json_error(403, "Origin is not allowed")
+            return
+        self.send_response(204)
+        self._send_cors_header()
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
+
+    def _require_bearer_token(self):
+        expected = _load_proxy_token()
+        if not expected:
+            self._json_error(503, "Proxy bearer token is not configured")
+            return False
+
+        authorization = self.headers.get('Authorization', '')
+        scheme, separator, supplied = authorization.partition(' ')
+        if separator != ' ' or scheme.lower() != 'bearer' or not hmac.compare_digest(supplied, expected):
+            self._json_error(401, "Missing or invalid bearer token", authenticate=True)
+            return False
+        return True
 
     def _handle_chat_completions(self):
         """Translate OpenAI request → Gemini → forward to extension → translate back."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
+            max_request_bytes = int(os.environ.get(
+                'PROXY_MAX_REQUEST_BYTES',
+                str(DEFAULT_MAX_REQUEST_BYTES)
+            ))
+            if content_length < 0:
+                raise ValueError("Content-Length cannot be negative")
+            if content_length > max_request_bytes:
+                self._json_error(
+                    413,
+                    f"Request body exceeds the {max_request_bytes}-byte limit"
+                )
+                return
             body = json.loads(self.rfile.read(content_length))
         except Exception as e:
             self._json_error(400, f"Invalid JSON: {e}")
             return
 
         model = body.get('model', 'gemini-3-flash-preview')
+        if not _is_valid_model(model):
+            self._json_error(
+                400,
+                "Invalid model identifier; use only letters, numbers, '.', '_', and '-'"
+            )
+            return
         gemini_body = openai_to_gemini(body)
         stream = body.get('stream', False)
 
@@ -577,7 +851,11 @@ class APIHandler(BaseHTTPRequestHandler):
             self._json_error(502, resp['error'])
             return
 
-        openai_response = gemini_to_openai(resp.get('data', {}), model)
+        try:
+            openai_response = gemini_to_openai(resp.get('data', {}), model)
+        except GeminiResponseError as exc:
+            self._json_error(502, str(exc), exc.details)
+            return
 
         if stream:
             self._send_streaming(openai_response, model)
@@ -596,7 +874,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'close')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self._send_cors_header()
         self.end_headers()
 
         choice = openai_response["choices"][0]
@@ -688,19 +966,31 @@ class APIHandler(BaseHTTPRequestHandler):
         body = json.dumps(data).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self._send_cors_header()
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _json_error(self, code, message):
-        body = json.dumps({"error": {"message": message, "type": "proxy_error"}}).encode('utf-8')
+    def _json_error(self, code, message, details=None, authenticate=False):
+        error = {"message": message, "type": "proxy_error"}
+        if details:
+            error["details"] = details
+        body = json.dumps({"error": error}).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self._send_cors_header()
+        if authenticate:
+            self.send_header('WWW-Authenticate', 'Bearer')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_cors_header(self):
+        request_origin = self.headers.get('Origin')
+        allowed_origin = os.environ.get('PROXY_ALLOWED_ORIGIN', '').strip()
+        if allowed_origin and request_origin == allowed_origin:
+            self.send_header('Access-Control-Allow-Origin', allowed_origin)
+            self.send_header('Vary', 'Origin')
 
     def log_message(self, *args):
         """Suppress HTTP logs — writing to stdout corrupts native messaging."""
@@ -722,9 +1012,8 @@ def main():
     standalone = '--standalone' in sys.argv
 
     # Start HTTP server in a proper thread (not daemon — we want clean shutdown)
-    # 0.0.0.0 allows Tailscale/VPS access. 127.0.0.1 for local only.
-    # Default to 0.0.0.0 for easier VPS/Tailscale deployment.
-    bind_address = os.environ.get('PROXY_BIND', '0.0.0.0')
+    # 0.0.0.0 allows Tailscale/VPS access only when explicitly requested.
+    bind_address = os.environ.get('PROXY_BIND', '127.0.0.1')
     server = ThreadedHTTPServer((bind_address, port), APIHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -732,13 +1021,13 @@ def main():
     if standalone:
         sys.stderr.write(f"[Proxy] Standalone mode — HTTP server on http://{bind_address}:{port}\n")
         if bind_address == '0.0.0.0':
-            sys.stderr.write(f"[Proxy] WARNING: Listening on 0.0.0.0 (all interfaces). No authentication is enabled.\n")
+            sys.stderr.write("[Proxy] WARNING: Listening on 0.0.0.0 (all interfaces). Bearer authentication is required.\n")
         sys.stderr.write(f"[Proxy] No native messaging — use curl or point any tool at the URL above\n")
         sys.stderr.flush()
         return
 
     if bind_address == '0.0.0.0':
-        sys.stderr.write(f"[Proxy] Warning: HTTP server listening on 0.0.0.0 (all interfaces).\n")
+        sys.stderr.write("[Proxy] Warning: HTTP server listening on 0.0.0.0 (all interfaces). Bearer authentication is required.\n")
         sys.stderr.flush()
 
     # Tell the extension we're ready
