@@ -45,6 +45,8 @@ import ipaddress
 import socket
 import urllib.parse
 import urllib.request
+import re
+import hmac
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from queue import Queue, Empty
@@ -96,6 +98,37 @@ pending_requests = {}  # request_id → Queue (for matching responses to request
 payload_store = {}     # request_id → gemini_body (for large payloads that exceed 1MB native messaging limit)
 HOST_PORT = 8765       # Set in main(), used by request handlers for payload fetch URLs
 
+MODEL_PATTERN = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def _is_valid_model(model):
+    return (
+        isinstance(model, str)
+        and bool(MODEL_PATTERN.fullmatch(model))
+        and '..' not in model
+    )
+
+
+DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
+
+def _token_file_path():
+    return os.environ.get(
+        'PROXY_TOKEN_FILE',
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '.proxy_token')
+    )
+
+
+def _load_proxy_token():
+    """Load the bearer token from the environment or a mode-600 token file."""
+    token = os.environ.get('PROXY_TOKEN', '').strip()
+    if token:
+        return token
+    try:
+        with open(_token_file_path(), 'r', encoding='utf-8') as token_file:
+            return token_file.read().strip()
+    except OSError:
+        return ''
 
 # ═══════════════════════════════════════════════════════════════════════════
 # REMOTE IMAGE FETCHING
@@ -580,12 +613,16 @@ class APIHandler(BaseHTTPRequestHandler):
     """HTTP handler exposing OpenAI-compatible endpoints."""
 
     def do_POST(self):
+        if self.path.startswith('/v1/') and not self._require_bearer_token():
+            return
         if self.path == '/v1/chat/completions':
             self._handle_chat_completions()
         else:
             self.send_error(404)
 
     def do_GET(self):
+        if self.path.startswith('/v1/') and not self._require_bearer_token():
+            return
         if self.path == '/v1/models':
             models = [
                 {"id": "gemini-3-flash-preview", "object": "model", "owned_by": "google", "description": "Gemini 3 Flash — fast, capable, great for agents"},
@@ -610,22 +647,58 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
+        request_origin = self.headers.get('Origin')
+        allowed_origin = os.environ.get('PROXY_ALLOWED_ORIGIN', '').strip()
+        if request_origin and request_origin != allowed_origin:
+            self._json_error(403, "Origin is not allowed")
+            return
+        self.send_response(204)
+        self._send_cors_header()
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
         self.end_headers()
+
+    def _require_bearer_token(self):
+        expected = _load_proxy_token()
+        if not expected:
+            self._json_error(503, "Proxy bearer token is not configured")
+            return False
+
+        authorization = self.headers.get('Authorization', '')
+        scheme, separator, supplied = authorization.partition(' ')
+        if separator != ' ' or scheme.lower() != 'bearer' or not hmac.compare_digest(supplied, expected):
+            self._json_error(401, "Missing or invalid bearer token", authenticate=True)
+            return False
+        return True
 
     def _handle_chat_completions(self):
         """Translate OpenAI request → Gemini → forward to extension → translate back."""
         try:
             content_length = int(self.headers.get('Content-Length', 0))
+            max_request_bytes = int(os.environ.get(
+                'PROXY_MAX_REQUEST_BYTES',
+                str(DEFAULT_MAX_REQUEST_BYTES)
+            ))
+            if content_length < 0:
+                raise ValueError("Content-Length cannot be negative")
+            if content_length > max_request_bytes:
+                self._json_error(
+                    413,
+                    f"Request body exceeds the {max_request_bytes}-byte limit"
+                )
+                return
             body = json.loads(self.rfile.read(content_length))
         except Exception as e:
             self._json_error(400, f"Invalid JSON: {e}")
             return
 
         model = body.get('model', 'gemini-3-flash-preview')
+        if not _is_valid_model(model):
+            self._json_error(
+                400,
+                "Invalid model identifier; use only letters, numbers, '.', '_', and '-'"
+            )
+            return
         gemini_body = openai_to_gemini(body)
         stream = body.get('stream', False)
 
@@ -706,7 +779,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-cache')
         self.send_header('Connection', 'close')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self._send_cors_header()
         self.end_headers()
 
         choice = openai_response["choices"][0]
@@ -798,19 +871,28 @@ class APIHandler(BaseHTTPRequestHandler):
         body = json.dumps(data).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self._send_cors_header()
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _json_error(self, code, message):
+    def _json_error(self, code, message, authenticate=False):
         body = json.dumps({"error": {"message": message, "type": "proxy_error"}}).encode('utf-8')
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
+        self._send_cors_header()
+        if authenticate:
+            self.send_header('WWW-Authenticate', 'Bearer')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_cors_header(self):
+        request_origin = self.headers.get('Origin')
+        allowed_origin = os.environ.get('PROXY_ALLOWED_ORIGIN', '').strip()
+        if allowed_origin and request_origin == allowed_origin:
+            self.send_header('Access-Control-Allow-Origin', allowed_origin)
+            self.send_header('Vary', 'Origin')
 
     def log_message(self, *args):
         """Suppress HTTP logs — writing to stdout corrupts native messaging."""
@@ -832,9 +914,8 @@ def main():
     standalone = '--standalone' in sys.argv
 
     # Start HTTP server in a proper thread (not daemon — we want clean shutdown)
-    # 0.0.0.0 allows Tailscale/VPS access. 127.0.0.1 for local only.
-    # Default to 0.0.0.0 for easier VPS/Tailscale deployment.
-    bind_address = os.environ.get('PROXY_BIND', '0.0.0.0')
+    # 0.0.0.0 allows Tailscale/VPS access only when explicitly requested.
+    bind_address = os.environ.get('PROXY_BIND', '127.0.0.1')
     server = ThreadedHTTPServer((bind_address, port), APIHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -842,13 +923,13 @@ def main():
     if standalone:
         sys.stderr.write(f"[Proxy] Standalone mode — HTTP server on http://{bind_address}:{port}\n")
         if bind_address == '0.0.0.0':
-            sys.stderr.write(f"[Proxy] WARNING: Listening on 0.0.0.0 (all interfaces). No authentication is enabled.\n")
+            sys.stderr.write("[Proxy] WARNING: Listening on 0.0.0.0 (all interfaces). Bearer authentication is required.\n")
         sys.stderr.write(f"[Proxy] No native messaging — use curl or point any tool at the URL above\n")
         sys.stderr.flush()
         return
 
     if bind_address == '0.0.0.0':
-        sys.stderr.write(f"[Proxy] Warning: HTTP server listening on 0.0.0.0 (all interfaces).\n")
+        sys.stderr.write("[Proxy] Warning: HTTP server listening on 0.0.0.0 (all interfaces). Bearer authentication is required.\n")
         sys.stderr.flush()
 
     # Tell the extension we're ready
