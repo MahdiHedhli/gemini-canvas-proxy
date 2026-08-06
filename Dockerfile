@@ -122,6 +122,7 @@ CMD []
 
 ENV PROXY_BIND=0.0.0.0 \
     PROXY_PORT=8765 \
+    PROXY_TOKEN_FILE=/browser-data/proxy-token \
     PYTHONUNBUFFERED=1 \
     DISPLAY=:99 \
     NOVNC_PORT=6080 \
